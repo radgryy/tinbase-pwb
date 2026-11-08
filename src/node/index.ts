@@ -1,0 +1,11 @@
+/** Node-only entrypoints (HTTP server, fs storage, project loading). */
+export { serve, findAvailablePort, type ServeOptions, type RunningServer } from './server.js'
+export { FsStorageDriver } from './fs-driver.js'
+export { loadSupabaseProject, type SupabaseProject } from './project.js'
+export { acceptWebSocket, type WsConnection } from './ws.js'
+export { createNativeEngine, ensurePostgres, type NativeEngineOptions } from './native/engine.js'
+export { PgWireClient, PgWireError } from './native/wire.js'
+export { loadFunctions, loadFunctionEnv, type LoadFunctionOptions } from './load-functions.js'
+export { bundleFunction, rewriteRemoteSpecifier } from './bundle-function.js'
+export { loadProjectConfig, type ProjectConfig } from './load-config.js'
+export { computeDbDiff, pullSchema, shadowNativeDataDir, type DbDiffOptions, type DbPullOptions, type DbPullResult } from './db-diff.js'

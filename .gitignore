@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.tinbase/
+*.tmp.ts
+*.tmp.mts
+.supalite/
+bench/.tmp-*
+bench/pb_migrations/
+dist-bin/
+admin-ui/node_modules/
+admin-ui/dist/
+
+# Claude Code session artifacts
+.claude/

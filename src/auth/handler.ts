@@ -1,0 +1,2481 @@
+/**
+ * GoTrue-compatible auth endpoints (/auth/v1/*) - the subset supabase-js
+ * uses for email/password auth, sessions, and admin user management.
+ */
+import type { Database } from '../db/database.js'
+import { randomToken, signJwt, verifyJwt, type JwtClaims } from '../jwt.js'
+import { TINBASE_VERSION, type Mailer, type RequestContext, type SmsSender } from '../types.js'
+import { OAuthService, type OAuthProviderConfig } from './oauth.js'
+import { asBcrypt2a, hashPassword, isBcryptHash, verifyPassword } from './password.js'
+import { qrSvgDataUri } from './qr.js'
+import { DEFAULT_AUTH_SETTINGS, type AuthSettings } from './settings.js'
+import { resolveRedirect } from './redirect.js'
+import { htmlToText, renderTemplate, type EmailTemplateName, type EmailTemplates } from './templates.js'
+import { callSendEmailHook, type EmailActionType, type SendEmailHookConfig } from './send-email-hook.js'
+import { RateLimiter } from './rate-limit.js'
+import { generateTotpSecret, otpauthUri, verifyTotp } from './totp.js'
+import { DEFAULT_SMS_TEMPLATE, e164, normalizePhone, renderSmsTemplate } from './sms.js'
+
+/** Construction-time config for {@link AuthHandler}. */
+export interface AuthConfig {
+  /** HS256 secret used to sign and verify access tokens */
+  jwtSecret: string
+  /**
+   * Where the *application* lives. The default redirect when a link carries no
+   * `redirect_to` or one the allowlist refuses, and what `{{ .SiteURL }}`
+   * interpolates to in an email template.
+   *
+   * This is GoTrue's `SITE_URL`, and it is not where this server answers - see
+   * {@link apiExternalUrl}.
+   */
+  siteUrl: string
+  /**
+   * Where *this server* answers, as a mail client can reach it. Emailed links
+   * are built on it and it is the token issuer.
+   *
+   * Separate from {@link siteUrl} because the two are different machines: a
+   * link has to come back here to be verified, while a user who finishes the
+   * flow belongs on the app. Collapsing them forces a choice between links
+   * that resolve and a redirect that lands somewhere useful - set to the API,
+   * every fallback dumps the user on this server's root; set to the app, no
+   * emailed link works at all.
+   *
+   * Defaults to {@link siteUrl}, which is the pre-0.17 behaviour.
+   */
+  apiExternalUrl?: string
+  /** Access-token lifetime in seconds. */
+  jwtExpiry: number
+  /** Force sign-out after this many seconds (config.toml auth.sessions.timebox). Caps session lifetime. */
+  sessionTimeboxSeconds?: number
+  /** sends outgoing auth email (magic links, OTP codes, recovery) */
+  mailer: Mailer
+  /** sends phone OTP codes (sign-in, signup confirmation, phone change) */
+  smsSender: SmsSender
+  /** `[auth.sms] template`; `{{ .Code }}` is the OTP. Default "Your code is {{ .Code }}". */
+  smsTemplate?: string
+  /** What `/settings` reports as `sms_provider` (twilio, or the dev inbox / a custom sender). */
+  smsProviderName?: string
+  /**
+   * Per-type HTML overrides from `[auth.email.template.*]`. A project that
+   * supplies one decides for itself what the mail offers - link, code, both, or
+   * a link straight to its own page - by which variables it interpolates.
+   * Types without an override keep the built-in default.
+   */
+  emailTemplates?: EmailTemplates
+  /**
+   * `[auth.hook.send_email]`. When set, the email is handed to this endpoint
+   * instead of being rendered and sent here - the endpoint owns the wording,
+   * the format and the provider.
+   */
+  sendEmailHook?: SendEmailHookConfig
+  /** Injectable fetch for the hook (tests capture the request). */
+  hookFetch?: typeof fetch
+  /** OAuth providers to enable, keyed by provider name (google, github, …) */
+  oauthProviders?: Record<string, OAuthProviderConfig>
+  /** injectable fetch for the OAuth provider calls (tests use a mock provider) */
+  oauthFetch?: typeof fetch
+  /**
+   * Additional redirect targets allowed beyond the site URL's own origin
+   * (GoTrue's URI_ALLOW_LIST). Entries may use `*`/`**` globs. A `redirect_to`
+   * that matches neither the site origin nor an entry falls back to the site URL.
+   */
+  uriAllowList?: string[]
+  /**
+   * Enforce the redirect allowlist strictly. Off for local dev (any well-formed
+   * URL is honored, like `supabase start`); the backend turns it on when
+   * network-exposed so redirects can't leave the allowed origins.
+   */
+  enforceRedirectAllowList?: boolean
+  /**
+   * Runtime-mutable toggles (signups, anonymous users, autoconfirm…). The
+   * admin API mutates this same object in place, so changes apply instantly.
+   */
+  settings?: AuthSettings
+  /**
+   * Rate limiter for login/signup/OTP/recovery. Defaults to a fresh in-memory
+   * limiter with GoTrue-shaped windows; pass `null` to disable (e.g. tests).
+   */
+  rateLimiter?: RateLimiter | null
+}
+
+interface UserRow {
+  id: string
+  aud: string | null
+  role: string | null
+  email: string | null
+  encrypted_password: string | null
+  email_confirmed_at: Date | string | null
+  last_sign_in_at: Date | string | null
+  raw_app_meta_data: Record<string, unknown> | null
+  raw_user_meta_data: Record<string, unknown> | null
+  created_at: Date | string | null
+  updated_at: Date | string | null
+  phone: string | null
+  phone_confirmed_at: Date | string | null
+  is_anonymous: boolean | null
+  email_change: string | null
+  phone_change: string | null
+}
+
+function authError(status: number, errorCode: string, msg: string): Response {
+  return json(status, { code: status, error_code: errorCode, msg })
+}
+
+/** The SMS provider refused or could not be reached; rendered as GoTrue's `sms_send_failed`. */
+class SmsSendFailed extends Error {}
+
+/**
+ * The per-request inputs supabase-js attaches to an email-sending call.
+ *
+ * `redirectTo` is the `?redirect_to=` query param set by `emailRedirectTo` /
+ * `resetPasswordForEmail(email, { redirectTo })`. `codeChallenge` and
+ * `codeChallengeMethod` are the body fields a `flowType: 'pkce'` client
+ * sends; their presence is what selects the PKCE variant of the link.
+ */
+/**
+ * The `auth.users` timestamp a flow measures `max_frequency` against, using
+ * GoTrue's column for that flow. These are schema columns, never caller input.
+ */
+type SentAtColumn =
+  | 'confirmation_sent_at'
+  | 'recovery_sent_at'
+  | 'email_change_sent_at'
+  | 'reauthentication_sent_at'
+  | 'phone_change_sent_at'
+
+/**
+ * Who a one-time token was issued to. Exactly one side is set: a token is
+ * addressed to an email or to a phone number, and the queries scope on
+ * whichever it is. `null` on both means "unscoped", which only the
+ * unguessable link token may be.
+ */
+type TokenScope = { email: string | null; phone?: undefined } | { phone: string; email?: undefined }
+
+interface EmailFlowOptions {
+  flavor?: 'login' | 'confirm' | 'invite'
+  redirectTo?: string | null
+  codeChallenge?: string | null
+  codeChallengeMethod?: string | null
+}
+
+/** Escape a value for interpolation into HTML text or an attribute. */
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
+}
+
+/**
+ * The HTML body of an auth email: a real `<a href>` for the link, plus the code.
+ *
+ * A text-only mail leaves the client to find the URL by pattern-matching, and a
+ * long auth link (query string, percent-encoded `redirect_to`) defeats that -
+ * Gmail on Android linkified only `https://<host>` of a 210-character recovery
+ * link and dropped `/auth/v1/verify?...`, so the tap landed on the API root.
+ * With an anchor the target is declared, not inferred.
+ *
+ * Deliberately plain inline HTML: no images, no external CSS, no web fonts -
+ * the things that get stripped, blocked, or land mail in spam.
+ */
+function authEmailHtml(o: { lead: string; action: string; link: string; code: string | null }): string {
+  const href = escapeHtml(o.link)
+  return [
+    `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.5;color:#1a1a1a">`,
+    `<p style="margin:0 0 20px">${escapeHtml(o.lead)}</p>`,
+    `<p style="margin:0 0 24px"><a href="${href}" style="display:inline-block;padding:12px 20px;background:#1a1a1a;color:#fff;text-decoration:none;border-radius:8px">${escapeHtml(o.action)}</a></p>`,
+    ...(o.code
+      ? [
+          `<p style="margin:0 0 8px;color:#666;font-size:14px">Or use this code:</p>`,
+          `<p style="margin:0 0 24px;font-size:24px;letter-spacing:3px;font-weight:600">${escapeHtml(o.code)}</p>`,
+        ]
+      : []),
+    `<p style="margin:0;color:#888;font-size:13px">If the button does not work, copy this address into your browser:<br><span style="word-break:break-all">${escapeHtml(o.link)}</span></p>`,
+    `</div>`,
+  ].join('')
+}
+
+/** A cryptographically-random numeric OTP of `length` digits (6-10). */
+/**
+ * Whether knowing `token` proves nothing on its own.
+ *
+ * An OTP is six to ten digits - a few hundred thousand guesses, which is
+ * nothing without the address it was sent to. The link token is 24 random
+ * bytes in base64url, which is not guessable and is all an emailed link can
+ * carry, so it stays redeemable unscoped.
+ *
+ * Decided from the token itself rather than from `token_type`, because both
+ * rows a recovery mints share one type - the shape is the only honest
+ * discriminator.
+ */
+function isGuessableToken(token: string): boolean {
+  return token.length < 20 || /^\d+$/.test(token)
+}
+
+function randomOtp(length: number): string {
+  const n = Math.max(6, Math.min(10, Math.floor(length)))
+  const buf = new Uint32Array(n)
+  crypto.getRandomValues(buf)
+  let code = ''
+  for (let i = 0; i < n; i++) code += String(buf[i] % 10)
+  return code
+}
+
+function json(status: number, body: unknown): Response {
+  return new Response(status === 204 ? null : JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  })
+}
+
+function iso(v: Date | string | null): string | null {
+  if (v === null || v === undefined) return null
+  return v instanceof Date ? v.toISOString() : new Date(v).toISOString()
+}
+
+/**
+ * Whole seconds since a timestamp the database wrote, or null when it never
+ * was. Computed here rather than as `now() - column` in SQL: the subset engine
+ * (pg-mem) cannot subtract timestamps, and the server's clock is the one that
+ * wrote the column on every engine but an external Postgres.
+ */
+function secondsSince(v: Date | string | null | undefined): number | null {
+  if (v === null || v === undefined) return null
+  const at = v instanceof Date ? v.getTime() : new Date(v).getTime()
+  return Number.isFinite(at) ? Math.floor((Date.now() - at) / 1000) : null
+}
+
+/** Routes and services the GoTrue-compatible `/auth/v1/*` endpoints. */
+export class AuthHandler {
+  private oauth: OAuthService
+  /** Shared, runtime-mutable settings - read on every request, never copied. */
+  private settings: AuthSettings
+  private rateLimiter: RateLimiter | null
+
+  constructor(
+    private db: Database,
+    private config: AuthConfig
+  ) {
+    this.oauth = new OAuthService(
+      db,
+      config.siteUrl,
+      config.apiExternalUrl || config.siteUrl,
+      config.oauthProviders ?? {},
+      config.oauthFetch ?? fetch,
+      config.uriAllowList,
+      config.enforceRedirectAllowList
+    )
+    this.settings = config.settings ?? { ...DEFAULT_AUTH_SETTINGS }
+    this.rateLimiter = config.rateLimiter === undefined ? new RateLimiter() : config.rateLimiter
+  }
+
+  /**
+   * Where this server answers: emailed links come back here, and tokens are
+   * issued by it. Falls back to the site URL, which is what a deployment that
+   * has not separated the two is already using for both.
+   */
+  private get apiUrl(): string {
+    return this.config.apiExternalUrl || this.config.siteUrl
+  }
+
+  /**
+   * Enforce the rate limit for `action`, keyed by client address. Returns a 429
+   * (GoTrue's `over_request_rate_limit`) when exceeded, else null to proceed.
+   */
+  private limit(action: string, req: Request): Response | null {
+    if (!this.rateLimiter) return null
+    const client = req.headers.get('x-tinbase-remote-addr') ?? 'local'
+    const retryAfter = this.rateLimiter.check(action, client)
+    if (retryAfter === null) return null
+    return new Response(
+      JSON.stringify({ code: 429, error_code: 'over_request_rate_limit', msg: 'Request rate limit reached' }),
+      { status: 429, headers: { 'content-type': 'application/json; charset=utf-8', 'retry-after': String(retryAfter) } }
+    )
+  }
+
+  /** GoTrue's 429 for `max_frequency`, with the seconds the caller must wait. */
+  private static tooSoon(retryAfter: number, channel: 'email' | 'sms' = 'email'): Response {
+    return new Response(
+      JSON.stringify({
+        code: 429,
+        error_code: channel === 'sms' ? 'over_sms_send_rate_limit' : 'over_email_send_rate_limit',
+        msg: `For security purposes, you can only request this after ${retryAfter} seconds.`,
+      }),
+      { status: 429, headers: { 'content-type': 'application/json; charset=utf-8', 'retry-after': String(retryAfter) } }
+    )
+  }
+
+  /**
+   * Enforce `max_frequency` the way GoTrue does: against the timestamp that
+   * flow last wrote on the user row, not against one budget per address.
+   *
+   * Which column a flow measures itself by is GoTrue's mapping, quirks
+   * included - a magic link is measured by `recovery_sent_at`, the same column
+   * password recovery uses, because GoTrue mints both from the recovery token.
+   * Sharing that budget is therefore correct rather than an oversight; a
+   * confirmation, by contrast, has its own. An app that sets `max_frequency`
+   * in config.toml gets the pacing Supabase's docs describe, which is the
+   * point of spelling it the same way.
+   *
+   * An address with no account has no row to measure, so those fall back to an
+   * in-memory window keyed the same way. GoTrue simply lets them through,
+   * which makes a 429 proof that an account exists - `/recover` answers 200
+   * for an address it has never seen precisely so the response cannot be used
+   * to enumerate accounts, and a frequency check that only ever fires for real
+   * users hands that back. The fallback keeps the two indistinguishable.
+   */
+  private async limitEmailFrequency(email: string, column: SentAtColumn): Promise<Response | null> {
+    const seconds = this.settings.maxEmailFrequencySeconds
+    if (!seconds || seconds <= 0) return null
+    const normalized = email.toLowerCase().trim()
+
+    // `column` is one of the literals in SentAtColumn, never caller input.
+    const res = await this.db.query(`select ${column} as sent_at from auth.users where email = $1`, [normalized])
+    const row = res.rows[0] as { sent_at: Date | string | null } | undefined
+
+    if (row) {
+      // A row exists: the column is the authority, and it survives a restart,
+      // which an in-memory counter does not.
+      const elapsed = secondsSince(row.sent_at)
+      if (elapsed !== null && elapsed < seconds) {
+        return AuthHandler.tooSoon(Math.max(1, seconds - elapsed))
+      }
+      return null
+    }
+
+    if (!this.rateLimiter) return null
+    const retryAfter = this.rateLimiter.check(`email_frequency:${column}`, normalized, Date.now(), {
+      limit: 1,
+      windowMs: seconds * 1000,
+    })
+    return retryAfter === null ? null : AuthHandler.tooSoon(retryAfter)
+  }
+
+  /**
+   * Record that this flow has just mailed the address, so the next request is
+   * measured from now. Written only after the mail was accepted - a transport
+   * that refused it has not spent the window.
+   */
+  private async markEmailSent(userId: string, column: SentAtColumn): Promise<void> {
+    await this.db.query(`update auth.users set ${column} = now() where id = $1`, [userId])
+  }
+
+  /** Stop background timers (rate-limiter sweep). Called on backend close. */
+  stop(): void {
+    this.rateLimiter?.stop()
+  }
+
+  /** Dispatch one `/auth/v1/*` request. Any thrown error becomes a 500 `unexpected_failure`. */
+  async handle(req: Request, ctx: RequestContext, url: URL): Promise<Response> {
+    const path = url.pathname.replace(/^\/auth\/v1\/?/, '').replace(/\/+$/, '')
+    const method = req.method.toUpperCase()
+
+    try {
+      if (path === 'health') return json(200, { name: 'tinbase-auth', version: TINBASE_VERSION, description: 'GoTrue-compatible auth' })
+      if (path === 'settings') {
+        const providers = Object.keys(this.config.oauthProviders ?? {})
+        return json(200, {
+          external: {
+            email: true,
+            phone: this.settings.phoneEnabled,
+            anonymous_users: this.settings.anonymousUsers,
+            ...Object.fromEntries(providers.map((p) => [p, !this.settings.disabledProviders.includes(p)])),
+          },
+          disable_signup: this.settings.disableSignup,
+          autoconfirm: this.settings.autoconfirm,
+          mailer_autoconfirm: this.settings.autoconfirm,
+          phone_autoconfirm: this.settings.smsAutoconfirm,
+          sms_provider: this.settings.phoneEnabled ? (this.config.smsProviderName ?? '') : '',
+          minimum_password_length: this.settings.minPasswordLength,
+        })
+      }
+      if (path === 'signup' && method === 'POST') return this.limit('signup', req) ?? (await this.signup(req, url))
+      if (path === 'token' && method === 'POST') return this.limit('token', req) ?? (await this.token(req, url))
+      if (path === 'user' && method === 'GET') return await this.getUser(req)
+      if (path === 'user' && method === 'PUT') return await this.updateUser(req, url)
+      if (path === 'logout' && method === 'POST') return await this.logout(req)
+      // /otp, /magiclink and /resend pick their limit (`otp` for mail, `sms`
+      // for a text) once the body says which, so they are rate-limited inside.
+      if (path === 'otp' && method === 'POST') return await this.sendOtp(req, url)
+      if (path === 'recover' && method === 'POST') return this.limit('recover', req) ?? (await this.sendRecovery(req, url))
+      if (path === 'magiclink' && method === 'POST') return await this.sendOtp(req, url)
+      if (path === 'resend' && method === 'POST') return await this.resend(req, url)
+      if (path === 'verify' && method === 'POST') return this.limit('verify', req) ?? (await this.verifyToken(req))
+      // Deliberately unlimited, unlike the POST above: a link carries no email,
+      // so after the scoping guard in redeem() this path can only redeem the
+      // 24-byte link token. There is nothing here left to guess.
+      if (path === 'verify' && method === 'GET') return await this.verifyLink(url)
+      if (path === 'factors' && method === 'POST') return await this.enrollFactor(req)
+      if (/^factors\/[^/]+\/challenge$/.test(path) && method === 'POST')
+        return await this.challengeFactor(req, path.split('/')[1])
+      if (/^factors\/[^/]+\/verify$/.test(path) && method === 'POST')
+        return await this.verifyFactor(req, path.split('/')[1])
+      if (/^factors\/[^/]+$/.test(path) && method === 'DELETE')
+        return await this.unenrollFactor(req, path.split('/')[1])
+      if (path === 'authorize' && method === 'GET') {
+        const provider = url.searchParams.get('provider') ?? ''
+        if (provider && this.settings.disabledProviders.includes(provider)) {
+          return authError(422, 'provider_disabled', `Sign-ins with ${provider} are disabled`)
+        }
+        return await this.oauth.authorize(url)
+      }
+      if (path === 'callback' && (method === 'GET' || method === 'POST')) {
+        return await this.oauth.callback(url, (userId) => this.sessionTokensFor(userId))
+      }
+      if (path.startsWith('admin/')) return await this.admin(req, ctx, path, method)
+      return authError(404, 'not_found', `unknown auth endpoint: ${path}`)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (e instanceof SmsSendFailed) return authError(500, 'sms_send_failed', `Error sending sms OTP: ${msg}`)
+      return authError(500, 'unexpected_failure', msg)
+    }
+  }
+
+  // ── flows ─────────────────────────────────────────────────────────────
+
+  private async signup(req: Request, url: URL): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      email?: string
+      phone?: string
+      password?: string
+      data?: Record<string, unknown>
+      code_challenge?: string
+      code_challenge_method?: string
+    }
+
+    if (body.phone && !body.email) return await this.signupWithPhone(req, body)
+
+    if (!body.email && !body.password) {
+      // supabase.auth.signInAnonymously()
+      if (!this.settings.anonymousUsers) {
+        return authError(422, 'anonymous_provider_disabled', 'Anonymous sign-ins are disabled')
+      }
+      const res = await this.db.query(
+        `insert into auth.users (aud, role, raw_app_meta_data, raw_user_meta_data, is_anonymous, last_sign_in_at)
+         values ('authenticated', 'authenticated', '{}', $1, true, now())
+         returning *`,
+        [JSON.stringify(body.data ?? {})]
+      )
+      return json(200, await this.sessionFor(res.rows[0] as UserRow))
+    }
+
+    if (this.settings.disableSignup) {
+      return authError(422, 'signup_disabled', 'Signups not allowed for this instance')
+    }
+    if (!body.email || !body.password) {
+      return authError(400, 'validation_failed', 'Signup requires a valid email and password')
+    }
+    if (body.password.length < this.settings.minPasswordLength) {
+      return authError(422, 'weak_password', `Password should be at least ${this.settings.minPasswordLength} characters.`)
+    }
+    const email = body.email.toLowerCase().trim()
+    const existing = await this.db.query(`select id from auth.users where email = $1`, [email])
+    if (existing.rows.length > 0) {
+      return authError(422, 'user_already_exists', 'User already registered')
+    }
+    // A signup that has to be confirmed sends mail, so it belongs under the
+    // same per-recipient budget as /otp and /recover. Repeating a signup was
+    // never the way to abuse that - the second is refused as
+    // `user_already_exists` before any mail is considered - but the
+    // confirmation not counting meant the three flows that can mail an address
+    // each spent the window separately, putting more into one inbox than
+    // `max_frequency` allows.
+    //
+    // Checked before the row is written, so a refusal leaves no half-made
+    // account behind, and only when confirmation is on: under autoconfirm
+    // there is no email to pace, and spending the budget would block a flow
+    // that would actually use it.
+    const autoconfirm = this.settings.autoconfirm
+    if (!autoconfirm) {
+      const tooSoon = await this.limitEmailFrequency(email, 'confirmation_sent_at')
+      if (tooSoon) return tooSoon
+    }
+    const hashed = await hashPassword(body.password)
+    const res = await this.db.query(
+      `insert into auth.users
+         (aud, role, email, encrypted_password, email_confirmed_at, last_sign_in_at,
+          raw_app_meta_data, raw_user_meta_data)
+       values ('authenticated', 'authenticated', $1, $2, case when $4 then now() else null end, now(),
+               '{"provider":"email","providers":["email"]}', $3)
+       returning *`,
+      [email, hashed, JSON.stringify(body.data ?? {}), autoconfirm]
+    )
+    const newUser = res.rows[0] as UserRow
+    // GoTrue records an `email` identity at signup, so user.identities reflects
+    // the email provider (getUser returned [] before this). Mirrors the shape
+    // written on anonymous-to-email upgrade.
+    await this.db.query(
+      `insert into auth.identities (user_id, provider, provider_id, identity_data)
+       values ($1, 'email', $2, $3)
+       on conflict (provider, provider_id) do nothing`,
+      [newUser.id, newUser.id, JSON.stringify({ sub: newUser.id, email: newUser.email })]
+    )
+    await this.audit('user_signedup', { actorId: newUser.id, actorEmail: email })
+    if (!autoconfirm) {
+      // confirmation required: email a verification link/code; no session yet
+      await this.issueToken(email, 'otp', false, {
+        flavor: 'confirm',
+        redirectTo: url.searchParams.get('redirect_to'),
+        ...AuthHandler.pkceFrom(body),
+      })
+      return json(200, this.userJson(newUser))
+    }
+    return json(200, await this.sessionFor(newUser))
+  }
+
+  /**
+   * Check a sign-in password against the stored hash. tinbase's own hashes are
+   * PBKDF2; a bcrypt hash (from a hosted-Supabase dump) is checked with
+   * pgcrypto's `crypt()` and, on a match, replaced with a PBKDF2 hash so the
+   * user moves over on their first sign-in. Engines without pgcrypto (pgmem)
+   * reject bcrypt hashes rather than throw.
+   */
+  private async checkPassword(user: UserRow, password: string): Promise<boolean> {
+    const stored = user.encrypted_password ?? ''
+    if (!isBcryptHash(stored)) return verifyPassword(password, stored)
+    const hash = asBcrypt2a(stored)
+    let ok = false
+    try {
+      const r = await this.db.query<{ ok: boolean }>(`select extensions.crypt($1, $2) = $2 as ok`, [password, hash])
+      ok = r.rows[0]?.ok === true
+    } catch {
+      return false
+    }
+    if (ok) {
+      await this.db.query(`update auth.users set encrypted_password = $1, updated_at = now() where id = $2`, [
+        await hashPassword(password),
+        user.id,
+      ])
+    }
+    return ok
+  }
+
+  private async token(req: Request, url: URL): Promise<Response> {
+    const grantType = url.searchParams.get('grant_type')
+    const body = (await req.json().catch(() => ({}))) as Record<string, string>
+
+    if (grantType === 'password') {
+      // supabase.auth.signInWithPassword({ phone, password }): same grant, the
+      // account looked up by number instead of address.
+      const byPhone = !!body.phone && !body.email
+      const email = (body.email ?? '').toLowerCase().trim()
+      const phone = byPhone ? normalizePhone(body.phone ?? '') : null
+      if (byPhone && !this.settings.phoneEnabled) return AuthHandler.phoneDisabled()
+      const res = byPhone
+        ? await this.db.query(`select * from auth.users where phone = $1`, [phone ?? ''])
+        : await this.db.query(`select * from auth.users where email = $1`, [email])
+      const user = res.rows[0] as UserRow | undefined
+      if (!user || !user.encrypted_password || !(await this.checkPassword(user, body.password ?? ''))) {
+        await this.audit('login_failed', { actorEmail: byPhone ? phone : email, traits: { grant_type: 'password' } })
+        return authError(400, 'invalid_credentials', 'Invalid login credentials')
+      }
+      // when confirmation is required, unverified accounts cannot sign in yet
+      if (byPhone && !this.settings.smsAutoconfirm && !user.phone_confirmed_at) {
+        return authError(400, 'phone_not_confirmed', 'Phone not confirmed')
+      }
+      if (!byPhone && !this.settings.autoconfirm && !user.email_confirmed_at) {
+        return authError(400, 'email_not_confirmed', 'Email not confirmed')
+      }
+      await this.db.query(`update auth.users set last_sign_in_at = now() where id = $1`, [user.id])
+      await this.audit('login', { actorId: user.id, actorEmail: user.email, traits: { grant_type: 'password' } })
+      return json(200, await this.sessionFor(user))
+    }
+
+    if (grantType === 'refresh_token') {
+      const token = body.refresh_token
+      if (!token) return authError(400, 'validation_failed', 'refresh_token required')
+      const res = await this.db.query(
+        `select rt.*, u.id as uid from auth.refresh_tokens rt
+         join auth.users u on u.id = rt.user_id
+         where rt.token = $1`,
+        [token]
+      )
+      const row = res.rows[0] as { revoked: boolean; user_id: string; session_id: string | null } | undefined
+      if (!row || row.revoked) {
+        return authError(400, 'refresh_token_not_found', 'Invalid Refresh Token: Refresh Token Not Found')
+      }
+      // A logout deletes the session but leaves its refresh tokens revoked; if
+      // the session is gone, the refresh token must not resurrect it.
+      if (row.session_id) {
+        const live = await this.db.query(`select 1 from auth.sessions where id = $1`, [row.session_id])
+        if (live.rows.length === 0) {
+          return authError(400, 'refresh_token_not_found', 'Invalid Refresh Token: Refresh Token Not Found')
+        }
+      }
+      await this.db.query(`update auth.refresh_tokens set revoked = true, updated_at = now() where token = $1`, [token])
+      const ures = await this.db.query(`select * from auth.users where id = $1`, [row.user_id])
+      return json(200, await this.sessionFor(ures.rows[0] as UserRow, token, { sessionId: row.session_id ?? undefined }))
+    }
+
+    if (grantType === 'pkce') {
+      const authCode = body.auth_code
+      const verifier = body.code_verifier
+      if (!authCode || !verifier) return authError(400, 'validation_failed', 'auth_code and code_verifier required')
+      const userId = await this.oauth.exchangePkce(authCode, verifier)
+      if (!userId) return authError(403, 'flow_state_not_found', 'invalid or expired auth code')
+      const ures = await this.db.query(`select * from auth.users where id = $1`, [userId])
+      return json(200, await this.sessionFor(ures.rows[0] as UserRow))
+    }
+
+    return authError(400, 'invalid_grant', `unsupported grant_type: ${grantType}`)
+  }
+
+  private async getUser(req: Request): Promise<Response> {
+    const user = await this.userFromBearer(req)
+    if (!user) return authError(401, 'no_authorization', 'Invalid or expired token')
+    return json(200, this.userJson(user, await this.getUserFactors(user.id), await this.getUserIdentities(user.id)))
+  }
+
+  private async updateUser(req: Request, url: URL): Promise<Response> {
+    const user = await this.userFromBearer(req)
+    if (!user) return authError(401, 'no_authorization', 'Invalid or expired token')
+    const body = (await req.json().catch(() => ({}))) as {
+      email?: string
+      phone?: string
+      password?: string
+      data?: Record<string, unknown>
+    }
+    const sets: string[] = []
+    const params: unknown[] = []
+    // Upgrading an anonymous user to a permanent one: adding an email (and
+    // usually a password) keeps the same id + data, flips is_anonymous off, and
+    // records an email identity - matching supabase.auth.updateUser({ email }).
+    const upgradingAnon = (user.is_anonymous ?? false) && !!body.email
+    const upgradingAnonByPhone = (user.is_anonymous ?? false) && !body.email && !!body.phone
+
+    // Changing the address on an account that already has one is a different
+    // operation from naming one for the first time, and only the first is an
+    // email change. An anonymous upgrade has no address to confirm from and
+    // nothing to lose if it is wrong, so it keeps taking effect immediately.
+    let pendingEmail: string | null = null
+    if (body.email) {
+      const email = body.email.toLowerCase().trim()
+      const clash = await this.db.query(`select id from auth.users where email = $1 and id <> $2`, [email, user.id])
+      if (clash.rows.length > 0) {
+        return authError(422, 'email_exists', 'A user with this email address has already been registered')
+      }
+      if (upgradingAnon || this.settings.autoconfirm || email === (user.email ?? '').toLowerCase()) {
+        params.push(email)
+        sets.push(`email = $${params.length}, email_confirmed_at = now()`)
+      } else {
+        pendingEmail = email
+      }
+    }
+    // A phone change mirrors the email one: a new number on an account that
+    // already has one is parked until the texted code comes back (unless SMS
+    // autoconfirm is on), while an anonymous upgrade takes effect at once.
+    let pendingPhone: string | null = null
+    if (body.phone) {
+      if (!this.settings.phoneEnabled) return AuthHandler.phoneDisabled()
+      const phone = normalizePhone(body.phone)
+      if (!phone) return AuthHandler.invalidPhone()
+      const clash = await this.db.query(`select id from auth.users where phone = $1 and id <> $2`, [phone, user.id])
+      if (clash.rows.length > 0) {
+        return authError(422, 'phone_exists', 'A user with this phone number has already been registered')
+      }
+      if (upgradingAnonByPhone || this.settings.smsAutoconfirm || phone === user.phone) {
+        params.push(phone)
+        sets.push(`phone = $${params.length}, phone_confirmed_at = now()`)
+      } else {
+        pendingPhone = phone
+      }
+    }
+    if (body.password) {
+      if (body.password.length < this.settings.minPasswordLength) {
+        return authError(422, 'weak_password', `Password should be at least ${this.settings.minPasswordLength} characters.`)
+      }
+      params.push(await hashPassword(body.password))
+      sets.push(`encrypted_password = $${params.length}`)
+    }
+    if (body.data) {
+      params.push(JSON.stringify(body.data))
+      sets.push(`raw_user_meta_data = coalesce(raw_user_meta_data, '{}'::jsonb) || $${params.length}::jsonb`)
+    }
+    if (upgradingAnon) {
+      sets.push(`is_anonymous = false`)
+      sets.push(`raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"provider":"email","providers":["email"]}'::jsonb`)
+    }
+    if (upgradingAnonByPhone) {
+      sets.push(`is_anonymous = false`)
+      sets.push(`raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"provider":"phone","providers":["phone"]}'::jsonb`)
+    }
+
+    let updated = user
+    if (sets.length > 0) {
+      params.push(user.id)
+      const res = await this.db.query(
+        `update auth.users set ${sets.join(', ')}, updated_at = now() where id = $${params.length} returning *`,
+        params
+      )
+      updated = res.rows[0] as UserRow
+    }
+    if (upgradingAnon) {
+      // record the email identity, unless one somehow already exists
+      await this.db.query(
+        `insert into auth.identities (user_id, provider, provider_id, identity_data)
+         values ($1, 'email', $2, $3)
+         on conflict (provider, provider_id) do nothing`,
+        [updated.id, updated.id, JSON.stringify({ sub: updated.id, email: updated.email })]
+      )
+    }
+
+    if (upgradingAnonByPhone) {
+      await this.ensurePhoneIdentity(updated)
+    }
+
+    if (pendingEmail) {
+      const started = await this.startEmailChange(updated, pendingEmail, url.searchParams.get('redirect_to'))
+      if (started) return started
+      const res = await this.db.query(`select * from auth.users where id = $1`, [updated.id])
+      updated = (res.rows[0] as UserRow) ?? updated
+    }
+    if (pendingPhone) {
+      const started = await this.startPhoneChange(updated, pendingPhone)
+      if (started) return started
+      const res = await this.db.query(`select * from auth.users where id = $1`, [updated.id])
+      updated = (res.rows[0] as UserRow) ?? updated
+    }
+    return json(200, this.userJson(updated))
+  }
+
+  /**
+   * Begin an email change: park the new address, mint a token for each side,
+   * and mail them.
+   *
+   * The address does not move until the tokens come back. Writing it straight
+   * to `auth.users.email` - which is what this did - means a session is all it
+   * takes to walk an account to an address of the holder's choosing, with no
+   * confirmation from either end and nothing sent to the address losing it.
+   *
+   * With `secure_email_change_enabled` (the Supabase default) both ends have
+   * to click: the new address proves it exists and is reachable, and the
+   * current one gets a say in losing the account. The second token is what
+   * makes a stolen session insufficient on its own.
+   *
+   * Returns a Response only when the change could not be started.
+   */
+  private async startEmailChange(user: UserRow, newEmail: string, redirectTo: string | null): Promise<Response | null> {
+    const tooSoon = await this.limitEmailFrequency(user.email ?? newEmail, 'email_change_sent_at')
+    if (tooSoon) return tooSoon
+
+    const { newToken, currentToken } = await this.mintEmailChangeTokens(user, newEmail)
+
+    const redirect = resolveRedirect(
+      redirectTo,
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
+    await this.mailEmailChange(user, newEmail, newEmail, newToken, 'email_change_new', redirect, redirectTo !== null)
+    if (currentToken) {
+      await this.mailEmailChange(user, user.email!, newEmail, currentToken, 'email_change_current', redirect, redirectTo !== null)
+    }
+    return null
+  }
+
+  /**
+   * Park the new address and mint a token per side, without sending anything.
+   *
+   * Shared with `admin/generate_link`, which needs the same tokens but hands
+   * them to the caller. One implementation so the two cannot disagree about
+   * how many sides there are or when the previous attempt is invalidated.
+   */
+  private async mintEmailChangeTokens(
+    user: UserRow,
+    newEmail: string
+  ): Promise<{ newToken: string; currentToken: string | null }> {
+    const secure = this.settings.secureEmailChange && !!user.email
+    const expiry = `${this.settings.otpExpirySeconds} seconds`
+    const newToken = randomToken(24)
+    const currentToken = secure ? randomToken(24) : null
+
+    // A second change replaces the first outright: leaving the old tokens live
+    // would let a link for a superseded address still land.
+    await this.db.query(
+      `delete from auth.one_time_tokens where user_id = $1 and token_type in ('email_change_new', 'email_change_current')`,
+      [user.id]
+    )
+    await this.db.query(
+      `insert into auth.one_time_tokens (user_id, email, token_type, token, expires_at)
+       values ($1, $2, 'email_change_new', $3, now() + $4::interval)`,
+      [user.id, newEmail, newToken, expiry]
+    )
+    if (currentToken) {
+      await this.db.query(
+        `insert into auth.one_time_tokens (user_id, email, token_type, token, expires_at)
+         values ($1, $2, 'email_change_current', $3, now() + $4::interval)`,
+        [user.id, user.email, currentToken, expiry]
+      )
+    }
+    await this.db.query(
+      `update auth.users
+         set email_change = $2, email_change_sent_at = now(), email_change_confirm_status = 0,
+             updated_at = now()
+       where id = $1`,
+      [user.id, newEmail]
+    )
+    return { newToken, currentToken }
+  }
+
+  /** One side of an email change, to whichever address that side belongs to. */
+  private async mailEmailChange(
+    user: UserRow,
+    to: string,
+    pending: string,
+    token: string,
+    action: 'email_change_new' | 'email_change_current',
+    redirect: string,
+    carryRedirect: boolean
+  ): Promise<void> {
+    let link = `${this.apiUrl}/auth/v1/verify?token=${token}&type=email_change`
+    if (carryRedirect) link += `&redirect_to=${encodeURIComponent(redirect)}`
+
+    if (this.config.sendEmailHook) {
+      // GoTrue sends one payload carrying both sides, so an endpoint can word
+      // them differently. token/token_hash are the side being asked, and
+      // token_new/token_hash_new the new address's - the fields that have been
+      // empty strings here since the hook was added, for want of this flow.
+      const isNew = action === 'email_change_new'
+      await callSendEmailHook(
+        this.config.sendEmailHook,
+        {
+          user: this.userJson(user),
+          email_data: {
+            token: '',
+            token_hash: token,
+            redirect_to: redirect,
+            email_action_type: action,
+            site_url: this.config.siteUrl,
+            token_new: '',
+            token_hash_new: isNew ? token : '',
+          },
+        },
+        this.config.hookFetch
+      )
+      return
+    }
+
+    const template = this.config.emailTemplates?.email_change
+    const lead =
+      action === 'email_change_new'
+        ? 'Confirm this address to finish moving your account to it:'
+        : `Confirm moving your account to ${pending}:`
+    const html = template?.content
+      ? renderTemplate(template.content, {
+          ConfirmationURL: link,
+          Token: '',
+          TokenHash: token,
+          RedirectTo: redirect,
+          SiteURL: this.config.siteUrl,
+          Email: to,
+        })
+      : authEmailHtml({ lead, action: 'Confirm email change', link, code: null })
+    await this.config.mailer.send({
+      to,
+      subject: template?.subject ?? 'Confirm your email change',
+      text: template?.content ? htmlToText(html) : `${lead} ${link}`,
+      html,
+    })
+  }
+
+
+  /**
+   * POST /auth/v1/logout[?scope=global|local|others]
+   *
+   * Deleting the session rows is what makes the logout observable: the access
+   * token stays cryptographically valid, so `/user` has to be able to see that
+   * its session is gone. Refresh tokens are revoked alongside, as before.
+   */
+  private async logout(req: Request): Promise<Response> {
+    const user = await this.userFromBearer(req)
+    if (user) {
+      const scope = new URL(req.url).searchParams.get('scope') ?? 'global'
+      const current = await this.sessionIdFromBearer(req)
+      if (scope === 'local' && current) {
+        await this.db.query(`delete from auth.sessions where id = $1`, [current])
+        await this.db.query(`update auth.refresh_tokens set revoked = true, updated_at = now() where session_id = $1`, [
+          current,
+        ])
+      } else if (scope === 'others' && current) {
+        await this.db.query(`delete from auth.sessions where user_id = $1 and id <> $2`, [user.id, current])
+        await this.db.query(
+          `update auth.refresh_tokens set revoked = true, updated_at = now()
+           where user_id = $1 and (session_id is null or session_id <> $2)`,
+          [user.id, current]
+        )
+      } else {
+        // global, and the fallback when a token carries no session to scope by
+        await this.db.query(`delete from auth.sessions where user_id = $1`, [user.id])
+        await this.db.query(`update auth.refresh_tokens set revoked = true, updated_at = now() where user_id = $1`, [
+          user.id,
+        ])
+      }
+      await this.audit('logout', { actorId: user.id, actorEmail: user.email, traits: { scope } })
+    }
+    return new Response(null, { status: 204 })
+  }
+
+  // ── OTP / magic links / recovery ──────────────────────────────────────
+
+  /**
+   * Create-or-find the user for `email` and mint its one-time code + link token
+   * pair, replacing any live tokens of the same type.
+   *
+   * Shared by the email-sending flows ({@link issueToken}) and the admin
+   * `generate_link` endpoint, which needs the very same tokens but hands them
+   * back to the caller instead of mailing them. Keeping one implementation is
+   * what stops the two from disagreeing about expiry, replacement, or which
+   * `token_type` rows get written - a link that `verify` can't redeem is worse
+   * than no link at all.
+   */
+  private async mintOneTimeToken(
+    email: string,
+    tokenType: 'otp' | 'recovery',
+    createUser: boolean
+  ): Promise<{ user: UserRow; code: string; linkToken: string } | { error: Response }> {
+    const normalized = email.toLowerCase().trim()
+    let res = await this.db.query(`select * from auth.users where email = $1`, [normalized])
+    let user = res.rows[0] as UserRow | undefined
+    if (!user) {
+      if (!createUser) return { error: authError(422, 'otp_disabled', 'Signups not allowed for otp') }
+      if (this.settings.disableSignup)
+        return { error: authError(422, 'signup_disabled', 'Signups not allowed for this instance') }
+      res = await this.db.query(
+        `insert into auth.users (aud, role, email, raw_app_meta_data, raw_user_meta_data)
+         values ('authenticated', 'authenticated', $1, '{"provider":"email","providers":["email"]}', '{}')
+         returning *`,
+        [normalized]
+      )
+      user = res.rows[0] as UserRow
+    }
+    const code = randomOtp(this.settings.otpLength)
+    const linkToken = randomToken(24)
+    const expiry = `${this.settings.otpExpirySeconds} seconds`
+    await this.db.query(`delete from auth.one_time_tokens where email = $1 and token_type = $2`, [normalized, tokenType])
+    await this.db.query(
+      `insert into auth.one_time_tokens (user_id, email, token_type, token, expires_at)
+       values ($1, $2, $3, $4, now() + $7::interval), ($1, $2, $5, $6, now() + $7::interval)`,
+      [user.id, normalized, tokenType, code, tokenType === 'otp' ? 'magiclink' : tokenType, linkToken, expiry]
+    )
+    return { user, code, linkToken }
+  }
+
+  /** Pull the PKCE fields out of a request body, or nothing when the client is on the implicit flow. */
+  private static pkceFrom(body: { code_challenge?: string; code_challenge_method?: string }): Pick<EmailFlowOptions, 'codeChallenge' | 'codeChallengeMethod'> {
+    return { codeChallenge: body.code_challenge ?? null, codeChallengeMethod: body.code_challenge_method ?? null }
+  }
+
+  /**
+   * Mint a one-time token for `email` and mail the link + code.
+   *
+   * GoTrue bakes `redirect_to` into the emailed link so that clicking it lands
+   * the user on the app's own screen (e.g. `/reset-password`); omitting it
+   * would send every link to the bare site URL instead. It goes through the
+   * same allow-list as {@link verifyLink} so a request can't mint a link that
+   * redirects to an origin the operator hasn't allowed.
+   *
+   * With a PKCE challenge, the challenge is parked in `auth.flow_state` under
+   * the link token (GoTrue does the same, `provider = 'email'`). Clicking the
+   * link then yields `?code=` for `exchangeCodeForSession` instead of putting
+   * the session tokens in the URL fragment - see {@link verifyLink}. The
+   * 6-digit code path (`verifyOtp`) is unaffected: it returns a session
+   * directly in both flows, as in GoTrue.
+   */
+  private async issueToken(
+    email: string,
+    tokenType: 'otp' | 'recovery',
+    createUser: boolean,
+    opts: EmailFlowOptions = {}
+  ): Promise<Response> {
+    const flavor = opts.flavor ?? 'login'
+    const minted = await this.mintOneTimeToken(email, tokenType, createUser)
+    if ('error' in minted) return minted.error
+    const { code, linkToken } = minted
+    const normalized = email.toLowerCase().trim()
+    const kind = tokenType === 'otp' ? 'magiclink' : tokenType
+    // GoTrue's mapping: a confirmation has its own budget, while a magic link
+    // and a recovery share `recovery_sent_at`.
+    // An invite is a confirmation of an address that has never been used, so
+    // GoTrue measures it by the same column - and does not pace it at all,
+    // since an operator inviting their own team is not the flooding case the
+    // window exists for.
+    const sentAtColumn: SentAtColumn =
+      flavor === 'confirm' || flavor === 'invite' ? 'confirmation_sent_at' : 'recovery_sent_at'
+    let link = `${this.apiUrl}/auth/v1/verify?token=${linkToken}&type=${kind}`
+    const redirectTo = resolveRedirect(
+      opts.redirectTo,
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
+    if (opts.redirectTo) link += `&redirect_to=${encodeURIComponent(redirectTo)}`
+    if (opts.codeChallenge) {
+      await this.db.query(
+        `insert into auth.flow_state (provider, provider_state, redirect_to, code_challenge, code_challenge_method, expires_at)
+         values ('email', $1, $2, $3, $4, now() + $5::interval)`,
+        [linkToken, redirectTo, opts.codeChallenge, opts.codeChallengeMethod, `${this.settings.otpExpirySeconds} seconds`]
+      )
+    }
+    // Whether the 6-digit code is offered alongside the link.
+    //
+    // Not for recovery: GoTrue's default Reset Password template carries only
+    // the link, and a 6-digit code is a far weaker credential for taking over
+    // an account than a 32-character token - it survives being forwarded and
+    // only has the attempt cap standing behind it. Offering it also strands
+    // anyone who tries to use it, since an app that never built a code-entry
+    // screen has nowhere to type it. The code row is still minted, so
+    // `verifyOtp({ email, token, type: 'recovery' })` keeps working for an app
+    // that does implement that screen.
+    const copy =
+      tokenType === 'recovery'
+        ? { subject: 'Reset your password', action: 'Reset your password', lead: 'Reset your password with this link:', code: null }
+        : flavor === 'invite'
+          ? // Link only, like recovery: the recipient has no account yet and so
+            // no screen to type a code into, and the link is what creates the
+            // session they need in order to set a password.
+            { subject: "You've been invited", action: 'Accept the invitation', lead: "You've been invited. Accept with this link:", code: null }
+          : flavor === 'confirm'
+            ? { subject: 'Confirm your email', action: 'Confirm your email', lead: 'Confirm your email address with this link:', code }
+            : { subject: 'Your login code', action: 'Sign in', lead: 'Sign in with this link:', code }
+    // The hook replaces rendering, so it is consulted before any of it happens.
+    if (this.config.sendEmailHook) {
+      const actionType: EmailActionType =
+        tokenType === 'recovery'
+          ? 'recovery'
+          : flavor === 'invite'
+            ? 'invite'
+            : flavor === 'confirm'
+              ? 'signup'
+              : 'magiclink'
+      await callSendEmailHook(
+        this.config.sendEmailHook,
+        {
+          user: this.userJson(minted.user),
+          email_data: {
+            token: code,
+            token_hash: linkToken,
+            redirect_to: redirectTo,
+            email_action_type: actionType,
+            site_url: this.config.siteUrl,
+            token_new: '',
+            token_hash_new: '',
+          },
+        },
+        this.config.hookFetch
+      )
+      await this.markEmailSent(minted.user.id, sentAtColumn)
+      return json(200, {})
+    }
+
+    const templateName: EmailTemplateName =
+      tokenType === 'recovery'
+        ? 'recovery'
+        : flavor === 'invite'
+          ? 'invite'
+          : flavor === 'confirm'
+            ? 'confirmation'
+            : 'magic_link'
+    const template = this.config.emailTemplates?.[templateName]
+    const defaultText =
+      tokenType === 'recovery'
+        ? `Reset your password with this link: ${link}`
+        : flavor === 'invite'
+          ? `You've been invited. Accept with this link: ${link}`
+          : flavor === 'confirm'
+            ? `Confirm your email address with this link: ${link}\n\nOr enter the code ${code}`
+            : `Your one-time code is ${code}\n\nOr sign in with this link: ${link}`
+    // A project's template replaces the body outright; its text companion is
+    // derived from it so the message stays multipart. `code` is always exposed
+    // here even though the default recovery mail omits it - a template that
+    // interpolates {{ .Token }} is a project saying it has a code-entry screen.
+    const html = template?.content
+      ? renderTemplate(template.content, {
+          ConfirmationURL: link,
+          Token: code,
+          TokenHash: linkToken,
+          RedirectTo: redirectTo,
+          SiteURL: this.config.siteUrl,
+          Email: normalized,
+        })
+      : authEmailHtml({ lead: copy.lead, action: copy.action, link, code: copy.code })
+    await this.config.mailer.send({
+      to: normalized,
+      subject: template?.subject ?? copy.subject,
+      text: template?.content ? htmlToText(html) : defaultText,
+      html,
+    })
+    await this.markEmailSent(minted.user.id, sentAtColumn)
+    return json(200, {})
+  }
+
+  private async sendOtp(req: Request, url: URL): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      email?: string
+      phone?: string
+      create_user?: boolean
+      data?: Record<string, unknown>
+      code_challenge?: string
+      code_challenge_method?: string
+    }
+    if (body.phone && !body.email) return await this.sendPhoneOtp(req, body)
+    if (!body.email) return authError(400, 'validation_failed', 'email is required')
+    const limited = this.limit('otp', req)
+    if (limited) return limited
+    const tooSoon = await this.limitEmailFrequency(body.email, 'recovery_sent_at')
+    if (tooSoon) return tooSoon
+    return this.issueToken(body.email, 'otp', body.create_user !== false, {
+      redirectTo: url.searchParams.get('redirect_to'),
+      ...AuthHandler.pkceFrom(body),
+    })
+  }
+
+  /**
+   * POST /auth/v1/resend - send the confirmation for `type` again.
+   *
+   * This used to be an alias for /magiclink, which is a different email
+   * entirely: it mails a login link measured by `recovery_sent_at`, creates an
+   * account for an address it has never seen, and pays no attention to `type`.
+   * So a resend for an address with no account signed that person up and sent
+   * them a way in, and a resend for a signup was paced by the recovery window.
+   *
+   * GoTrue answers 200 with an empty body both for an address it does not know
+   * and for one already confirmed - the two look identical from outside, which
+   * is what stops the endpoint from reporting who has an account. No mail goes
+   * out in either case.
+   */
+  private async resend(req: Request, url: URL): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      type?: string
+      email?: string
+      phone?: string
+      code_challenge?: string
+      code_challenge_method?: string
+    }
+    if (!body.type) return authError(400, 'validation_failed', 'Missing one of these arguments: type')
+    if (body.type === 'sms' || body.type === 'phone_change') {
+      return await this.resendSms(req, body.type, body.phone)
+    }
+    if (body.type === 'email_change') {
+      // The email-change flow itself does not exist yet, so there is no
+      // pending address to confirm. Say that, rather than resending something
+      // else and calling it an email change.
+      return authError(400, 'validation_failed', 'Resend type "email_change" is not supported yet')
+    }
+    if (body.type !== 'signup') {
+      return authError(400, 'validation_failed', `Resend requires a valid type: ${body.type}`)
+    }
+    if (!body.email) return authError(400, 'validation_failed', 'email is required')
+    const limited = this.limit('otp', req)
+    if (limited) return limited
+
+    const normalized = body.email.toLowerCase().trim()
+    const res = await this.db.query(`select id, email_confirmed_at from auth.users where email = $1`, [normalized])
+    const user = res.rows[0] as { id: string; email_confirmed_at: Date | string | null } | undefined
+    // Nothing to confirm, either because there is no account or because it is
+    // already confirmed. Answered the same way, and without creating anything:
+    // a resend is a repeat of a mail the address has already been sent, never
+    // the thing that signs someone up.
+    if (!user || user.email_confirmed_at) return json(200, {})
+
+    const tooSoon = await this.limitEmailFrequency(normalized, 'confirmation_sent_at')
+    if (tooSoon) return tooSoon
+
+    return this.issueToken(normalized, 'otp', false, {
+      flavor: 'confirm',
+      redirectTo: url.searchParams.get('redirect_to'),
+      ...AuthHandler.pkceFrom(body),
+    })
+  }
+
+  private async sendRecovery(req: Request, url: URL): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      email?: string
+      code_challenge?: string
+      code_challenge_method?: string
+    }
+    if (!body.email) return authError(400, 'validation_failed', 'email is required')
+    const tooSoon = await this.limitEmailFrequency(body.email, 'recovery_sent_at')
+    if (tooSoon) return tooSoon
+    // GoTrue answers 200 for an address it has never seen, so the response
+    // can't be used to enumerate which emails have accounts. supabase-js apps
+    // rely on this to show "check your inbox" unconditionally.
+    const normalized = body.email.toLowerCase().trim()
+    const existing = await this.db.query(`select 1 from auth.users where email = $1`, [normalized])
+    if (existing.rows.length === 0) return json(200, {})
+    return this.issueToken(body.email, 'recovery', false, {
+      redirectTo: url.searchParams.get('redirect_to'),
+      ...AuthHandler.pkceFrom(body),
+    })
+  }
+
+  /** Max wrong guesses for a one-time code before its tokens are invalidated. */
+  private static readonly MAX_OTP_ATTEMPTS = 5
+
+  private async redeem(token: string, types: string[], scope: TokenScope = { email: null }): Promise<UserRow | null> {
+    // `|| null`, not `??`: an empty string is an absent address, not one to
+    // match on. Left as '' it reaches the query as `email = ''`, which matches
+    // nothing, and a client that sends `email: ''` beside a link token has a
+    // good token refused.
+    const byPhone = scope.phone !== undefined
+    const column = byPhone ? 'phone' : 'email'
+    const identifier = byPhone ? scope.phone : scope.email?.toLowerCase().trim() || null
+    // SECURITY: a guessable code is only a credential together with the address
+    // it was sent to. Unscoped, `token = $1` matches whoever happens to hold a
+    // live code - so one guess is tried against every account at once - and the
+    // attempt counter below needs the email to know what to count, so the
+    // lockout never fires either. Refuse rather than widen the match.
+    if (!identifier && isGuessableToken(token)) return null
+    // `column` is one of two literals chosen above, never caller input.
+    const res = await this.db.query(
+      `delete from auth.one_time_tokens
+       where token = $1 and token_type = any($2::text[])
+         and ($3::text is null or ${column} = $3) and expires_at > now()
+         and attempts < $4
+       returning user_id, email, phone`,
+      [token, `{${types.join(',')}}`, identifier, AuthHandler.MAX_OTP_ATTEMPTS]
+    )
+    const row = res.rows[0] as { user_id: string; email: string | null; phone: string | null } | undefined
+    if (!row) {
+      // Wrong/expired code: count the failed guess against the live tokens for
+      // this email, and burn them once the attempt cap is hit (brute-force
+      // lockout for the 6-digit OTP). Requires the email to scope the counter.
+      if (identifier) {
+        await this.db.query(
+          `update auth.one_time_tokens set attempts = attempts + 1
+           where ${column} = $1 and token_type = any($2::text[]) and expires_at > now()`,
+          [identifier, `{${types.join(',')}}`]
+        )
+        await this.db.query(
+          `delete from auth.one_time_tokens where ${column} = $1 and attempts >= $2`,
+          [identifier, AuthHandler.MAX_OTP_ATTEMPTS]
+        )
+      }
+      return null
+    }
+    // Every other live token addressed the same way is spent with this one.
+    if (row.phone) await this.db.query(`delete from auth.one_time_tokens where phone = $1`, [row.phone])
+    else if (row.email) await this.db.query(`delete from auth.one_time_tokens where email = $1`, [row.email])
+    const ures = byPhone
+      ? await this.db.query(
+          `update auth.users set phone_confirmed_at = coalesce(phone_confirmed_at, now()), last_sign_in_at = now()
+           where id = $1 returning *`,
+          [row.user_id]
+        )
+      : await this.db.query(
+          `update auth.users set email_confirmed_at = coalesce(email_confirmed_at, now()), last_sign_in_at = now()
+           where id = $1 returning *`,
+          [row.user_id]
+        )
+    return (ures.rows[0] as UserRow) ?? null
+  }
+
+  /**
+   * The `one_time_tokens.token_type` rows a given verification type may redeem.
+   *
+   * A recovery (password-reset) token must be redeemed with type=recovery
+   * explicitly - never fold it into the default set, or a guessed login OTP
+   * could mint a recovery session. Everything else (`otp`, `signup`, `invite`,
+   * `email`, or absent) redeems the login pair, since those all mint the same
+   * otp+magiclink rows.
+   */
+  private static redeemTypes(type?: string): string[] {
+    if (type === 'recovery') return ['recovery']
+    if (type === 'email_change') return ['email_change_new', 'email_change_current']
+    if (type === 'magiclink') return ['magiclink']
+    return ['otp', 'magiclink']
+  }
+
+  /** What a caller is told when one side of an email change is still outstanding. */
+  private static readonly EMAIL_CHANGE_PENDING_MSG =
+    'Confirmation link accepted. Please proceed to confirm link sent to the other email'
+
+  /**
+   * Redeem one side of an email change.
+   *
+   * Not routed through {@link redeem}, which exists for the login and recovery
+   * tokens and does things that are wrong here: it clears every live token for
+   * the address and stamps `last_sign_in_at`, and an email change is not a
+   * sign-in. It also cannot express the part that matters - that one click may
+   * not be enough.
+   *
+   * The address moves only once no side is left outstanding. With
+   * `secure_email_change_enabled` that means both tokens, in either order;
+   * with it off there is only ever the new address's. Deciding it by what
+   * remains in the table, rather than by counting clicks, is what makes the
+   * order irrelevant and a replay harmless - the row is gone the moment it is
+   * redeemed.
+   */
+  private async verifyEmailChange(
+    token: string
+  ): Promise<{ status: 'invalid' } | { status: 'pending' } | { status: 'done'; user: UserRow }> {
+    const res = await this.db.query(
+      `delete from auth.one_time_tokens
+        where token = $1 and token_type in ('email_change_new', 'email_change_current')
+          and expires_at > now()
+        returning user_id`,
+      [token]
+    )
+    const row = res.rows[0] as { user_id: string } | undefined
+    if (!row) return { status: 'invalid' }
+
+    const outstanding = await this.db.query(
+      `select 1 from auth.one_time_tokens
+        where user_id = $1 and token_type in ('email_change_new', 'email_change_current')
+          and expires_at > now()`,
+      [row.user_id]
+    )
+    if (outstanding.rows.length > 0) {
+      await this.db.query(
+        `update auth.users set email_change_confirm_status = 1, updated_at = now() where id = $1`,
+        [row.user_id]
+      )
+      return { status: 'pending' }
+    }
+
+    // `nullif` guards the case where the pending address was cleared in
+    // between: better to confirm the address already held than to blank it.
+    const done = await this.db.query(
+      `update auth.users
+          set email = coalesce(nullif(email_change, ''), email),
+              email_confirmed_at = now(),
+              email_change = '',
+              email_change_token_new = '',
+              email_change_token_current = '',
+              email_change_confirm_status = 0,
+              updated_at = now()
+        where id = $1
+        returning *`,
+      [row.user_id]
+    )
+    const user = done.rows[0] as UserRow | undefined
+    if (!user) return { status: 'invalid' }
+
+    // The email identity carries the address too, and getUser reads it back
+    // through user.identities - left alone it would still name the old one.
+    await this.db.query(
+      `update auth.identities
+          set identity_data = coalesce(identity_data, '{}'::jsonb) || jsonb_build_object('email', $2::text),
+              updated_at = now()
+        where user_id = $1 and provider = 'email'`,
+      [user.id, user.email]
+    )
+    return { status: 'done', user }
+  }
+
+  private async verifyToken(req: Request): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      type?: string
+      email?: string
+      phone?: string
+      token?: string
+      token_hash?: string
+    }
+    // supabase-js sends `token_hash` for verifyOtp({ token_hash }) - the shape
+    // `admin.generateLink` feeds - and `token` for verifyOtp({ email, token }).
+    // Accept either; ours are opaque one-time tokens, so the two are the same
+    // string here.
+    const token = body.token ?? body.token_hash
+    if (!token) return authError(400, 'validation_failed', 'token is required')
+    if (body.type === 'sms' || body.type === 'phone_change') {
+      return await this.verifySmsToken(body.type, body.phone, token)
+    }
+    if (body.type === 'email_change') {
+      const outcome = await this.verifyEmailChange(token)
+      if (outcome.status === 'invalid') return authError(403, 'otp_expired', 'Token has expired or is invalid')
+      if (outcome.status === 'pending') return json(200, { msg: AuthHandler.EMAIL_CHANGE_PENDING_MSG })
+      return json(200, await this.sessionFor(outcome.user))
+    }
+    const user = await this.redeem(token, AuthHandler.redeemTypes(body.type), { email: body.email ?? null })
+    if (!user) return authError(403, 'otp_expired', 'Token has expired or is invalid')
+    // A PKCE challenge parked for the link is moot once the code was typed in
+    // instead; drop it so nothing is left to redeem.
+    await this.db.query(`delete from auth.flow_state where provider = 'email' and provider_state = $1`, [token])
+    return json(200, await this.sessionFor(user))
+  }
+
+  private async verifyLink(url: URL): Promise<Response> {
+    const token = url.searchParams.get('token') ?? ''
+    const type = url.searchParams.get('type') ?? 'magiclink'
+    // Never redirect (with the freshly minted session tokens) to an origin the
+    // operator hasn't allowed - a crafted magic-link would otherwise exfiltrate
+    // the session. Unknown targets fall back to the site URL.
+    const redirectTo = resolveRedirect(
+      url.searchParams.get('redirect_to'),
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
+    if (type === 'email_change') {
+      const outcome = await this.verifyEmailChange(token)
+      if (outcome.status === 'invalid') {
+        return new Response(null, {
+          status: 303,
+          headers: { location: `${redirectTo}#error=access_denied&error_code=otp_expired` },
+        })
+      }
+      if (outcome.status === 'pending') {
+        // Nothing to hand back yet - the account is still on its old address
+        // until the other side answers, so there is no session to mint.
+        return new Response(null, {
+          status: 303,
+          headers: {
+            location: `${redirectTo}#message=${encodeURIComponent(AuthHandler.EMAIL_CHANGE_PENDING_MSG)}`,
+          },
+        })
+      }
+      const changed = (await this.sessionFor(outcome.user)) as {
+        access_token: string
+        refresh_token: string
+        expires_in: number
+      }
+      return new Response(null, {
+        status: 303,
+        headers: {
+          location:
+            `${redirectTo}#access_token=${changed.access_token}&refresh_token=${changed.refresh_token}` +
+            `&expires_in=${changed.expires_in}&token_type=bearer&type=email_change`,
+        },
+      })
+    }
+    const user = await this.redeem(token, AuthHandler.redeemTypes(type))
+    if (!user) {
+      return new Response(null, { status: 303, headers: { location: `${redirectTo}#error=access_denied&error_code=otp_expired` } })
+    }
+
+    // PKCE: the request that sent this email parked a code_challenge under the
+    // link token. Hand back a one-shot auth code (redirect_to?code=...) for
+    // POST /token?grant_type=pkce - the same exchange OAuth uses - instead of
+    // exposing the session tokens in the URL. supabase-js remembers which flow
+    // (recovery vs. magic link) it started, so no `type` is needed here.
+    const flow = await this.db.query(
+      `delete from auth.flow_state where provider = 'email' and provider_state = $1 returning code_challenge, code_challenge_method`,
+      [token]
+    )
+    const pkce = flow.rows[0] as { code_challenge: string | null; code_challenge_method: string | null } | undefined
+    if (pkce?.code_challenge) {
+      const authCode = randomToken(24)
+      await this.db.query(
+        `insert into auth.flow_state (provider, provider_state, redirect_to, code_challenge, code_challenge_method, auth_code, user_id, expires_at)
+         values ('email', $1, $2, $3, $4, $5, $6, now() + interval '5 minutes')`,
+        [randomToken(16), redirectTo, pkce.code_challenge, pkce.code_challenge_method, authCode, user.id]
+      )
+      return new Response(null, { status: 303, headers: { location: `${redirectTo}?code=${authCode}` } })
+    }
+
+    const session = (await this.sessionFor(user)) as { access_token: string; refresh_token: string; expires_in: number }
+    const hash = `#access_token=${session.access_token}&refresh_token=${session.refresh_token}&expires_in=${session.expires_in}&token_type=bearer&type=${type}`
+    return new Response(null, { status: 303, headers: { location: `${redirectTo}${hash}` } })
+  }
+
+  // ── phone (SMS OTP) ───────────────────────────────────────────────────
+  //
+  // GoTrue's phone flows, on the same token table and the same attempt and
+  // expiry rules as email. The differences are what a text is: there is no
+  // link, only the code, so every phone token is a single guessable row scoped
+  // to its number; and each one costs money, so sending is paced by both the
+  // per-caller `sms` window and the per-recipient `max_frequency`.
+
+  /** GoTrue's answer to any phone endpoint while phone auth is off. */
+  private static phoneDisabled(): Response {
+    return authError(400, 'phone_provider_disabled', 'Unsupported phone provider')
+  }
+
+  private static invalidPhone(): Response {
+    return authError(400, 'validation_failed', 'Invalid phone number format (E.164 required)')
+  }
+
+  /**
+   * `[auth.sms] max_frequency`, measured like {@link limitEmailFrequency}:
+   * against the column that flow last wrote on the recipient's row, with an
+   * in-memory window for a number that has no row yet.
+   */
+  private async limitSmsFrequency(phone: string, column: SentAtColumn): Promise<Response | null> {
+    const seconds = this.settings.maxSmsFrequencySeconds
+    if (!seconds || seconds <= 0) return null
+    const res = await this.db.query(`select ${column} as sent_at from auth.users where phone = $1`, [phone])
+    const row = res.rows[0] as { sent_at: Date | string | null } | undefined
+    if (row) {
+      const elapsed = secondsSince(row.sent_at)
+      if (elapsed !== null && elapsed < seconds) {
+        return AuthHandler.tooSoon(Math.max(1, seconds - elapsed), 'sms')
+      }
+      return null
+    }
+    if (!this.rateLimiter) return null
+    const retryAfter = this.rateLimiter.check(`sms_frequency:${column}`, phone, Date.now(), {
+      limit: 1,
+      windowMs: seconds * 1000,
+    })
+    return retryAfter === null ? null : AuthHandler.tooSoon(retryAfter, 'sms')
+  }
+
+  /**
+   * Mint a code for `phone`, replacing any live one of the same type, and
+   * text it. The send column is written only once the provider accepted the
+   * message, as with mail. Returns the provider's message id when it gave one.
+   */
+  private async sendSmsCode(
+    user: UserRow,
+    phone: string,
+    tokenType: 'sms' | 'phone_change',
+    column: SentAtColumn
+  ): Promise<string | void> {
+    const code = randomOtp(this.settings.smsOtpLength)
+    await this.db.query(`delete from auth.one_time_tokens where phone = $1 and token_type = $2`, [phone, tokenType])
+    await this.db.query(
+      `insert into auth.one_time_tokens (user_id, phone, token_type, token, expires_at)
+       values ($1, $2, $3, $4, now() + $5::interval)`,
+      [user.id, phone, tokenType, code, `${this.settings.smsOtpExpirySeconds} seconds`]
+    )
+    const body = renderSmsTemplate(this.config.smsTemplate || DEFAULT_SMS_TEMPLATE, code)
+    let messageId: string | void
+    try {
+      messageId = await this.config.smsSender.send({ to: e164(phone), body })
+    } catch (e) {
+      // Nobody received the code, so nothing should be redeemable: GoTrue rolls
+      // the token back with the failed send. Seen live (staging, 2026-10-23): a
+      // refused send still left a row that `/verify` accepted.
+      await this.db.query(`delete from auth.one_time_tokens where phone = $1 and token_type = $2 and token = $3`, [phone, tokenType, code])
+      // GoTrue's shape for a provider that refused the text (bad number, over
+      // the provider's limit, unreachable): the caller learns why, under the
+      // code supabase-js clients already handle, rather than a bare 500.
+      throw new SmsSendFailed(e instanceof Error ? e.message : String(e))
+    }
+    await this.markEmailSent(user.id, column)
+    return messageId ?? undefined
+  }
+
+  /** Create the account a phone OTP is for, with GoTrue's provider metadata. */
+  private async createPhoneUser(phone: string, data: Record<string, unknown> | undefined, extra: { password?: string | null; confirmed: boolean }): Promise<UserRow> {
+    const hashed = extra.password ? await hashPassword(extra.password) : null
+    const res = await this.db.query(
+      `insert into auth.users
+         (aud, role, phone, encrypted_password, phone_confirmed_at, last_sign_in_at,
+          raw_app_meta_data, raw_user_meta_data)
+       values ('authenticated', 'authenticated', $1, $2, case when $4 then now() else null end, now(),
+               '{"provider":"phone","providers":["phone"]}', $3)
+       returning *`,
+      [phone, hashed, JSON.stringify(data ?? {}), extra.confirmed]
+    )
+    const user = res.rows[0] as UserRow
+    await this.ensurePhoneIdentity(user)
+    return user
+  }
+
+  /** The `phone` identity GoTrue records, so `user.identities` names the provider. */
+  private async ensurePhoneIdentity(user: UserRow): Promise<void> {
+    await this.db.query(
+      `insert into auth.identities (user_id, provider, provider_id, identity_data)
+       values ($1, 'phone', $2, $3)
+       on conflict (provider, provider_id) do update
+         set identity_data = excluded.identity_data, updated_at = now()`,
+      [user.id, user.id, JSON.stringify({ sub: user.id, phone: user.phone })]
+    )
+  }
+
+  /** `supabase.auth.signUp({ phone, password })`. */
+  private async signupWithPhone(
+    req: Request,
+    body: { phone?: string; password?: string; data?: Record<string, unknown> }
+  ): Promise<Response> {
+    if (!this.settings.phoneEnabled) return AuthHandler.phoneDisabled()
+    if (this.settings.disableSignup) {
+      return authError(422, 'signup_disabled', 'Signups not allowed for this instance')
+    }
+    if (!body.password) {
+      return authError(400, 'validation_failed', 'Signup requires a valid phone number and password')
+    }
+    const phone = normalizePhone(body.phone ?? '')
+    if (!phone) return AuthHandler.invalidPhone()
+    if (body.password.length < this.settings.minPasswordLength) {
+      return authError(422, 'weak_password', `Password should be at least ${this.settings.minPasswordLength} characters.`)
+    }
+    const existing = await this.db.query(`select id from auth.users where phone = $1`, [phone])
+    if (existing.rows.length > 0) {
+      return authError(422, 'user_already_exists', 'User already registered')
+    }
+    const autoconfirm = this.settings.smsAutoconfirm
+    if (!autoconfirm) {
+      // The confirmation is a text, so it is paced like one - before the row
+      // is written, so a refusal leaves no half-made account behind.
+      const limited = this.limit('sms', req)
+      if (limited) return limited
+      const tooSoon = await this.limitSmsFrequency(phone, 'confirmation_sent_at')
+      if (tooSoon) return tooSoon
+    }
+    const user = await this.createPhoneUser(phone, body.data, { password: body.password, confirmed: autoconfirm })
+    await this.audit('user_signedup', { actorId: user.id, actorEmail: phone })
+    if (!autoconfirm) {
+      await this.sendSmsCode(user, phone, 'sms', 'confirmation_sent_at')
+      return json(200, this.userJson(user))
+    }
+    return json(200, await this.sessionFor(user))
+  }
+
+  /** `supabase.auth.signInWithOtp({ phone })`: text a code, creating the account unless told not to. */
+  private async sendPhoneOtp(
+    req: Request,
+    body: { phone?: string; create_user?: boolean; data?: Record<string, unknown> }
+  ): Promise<Response> {
+    if (!this.settings.phoneEnabled) return AuthHandler.phoneDisabled()
+    const phone = normalizePhone(body.phone ?? '')
+    if (!phone) return AuthHandler.invalidPhone()
+    const limited = this.limit('sms', req)
+    if (limited) return limited
+    const tooSoon = await this.limitSmsFrequency(phone, 'confirmation_sent_at')
+    if (tooSoon) return tooSoon
+
+    const res = await this.db.query(`select * from auth.users where phone = $1`, [phone])
+    let user = res.rows[0] as UserRow | undefined
+    if (!user) {
+      if (body.create_user === false) return authError(422, 'otp_disabled', 'Signups not allowed for otp')
+      if (this.settings.disableSignup) {
+        return authError(422, 'signup_disabled', 'Signups not allowed for this instance')
+      }
+      user = await this.createPhoneUser(phone, body.data, { confirmed: false })
+    }
+    const messageId = await this.sendSmsCode(user, phone, 'sms', 'confirmation_sent_at')
+    return json(200, messageId ? { message_id: messageId } : {})
+  }
+
+  /**
+   * `supabase.auth.resend({ phone, type: 'sms' | 'phone_change' })`.
+   *
+   * Like the email resend: 200 and no text for a number with nothing pending,
+   * whether because it has no account, is already confirmed, or has no change
+   * under way - so the endpoint cannot be used to find out which.
+   */
+  private async resendSms(req: Request, type: 'sms' | 'phone_change', rawPhone: string | undefined): Promise<Response> {
+    if (!this.settings.phoneEnabled) return AuthHandler.phoneDisabled()
+    if (!rawPhone) return authError(400, 'validation_failed', 'phone is required')
+    const phone = normalizePhone(rawPhone)
+    if (!phone) return AuthHandler.invalidPhone()
+    const limited = this.limit('sms', req)
+    if (limited) return limited
+
+    if (type === 'sms') {
+      const res = await this.db.query(`select * from auth.users where phone = $1`, [phone])
+      const user = res.rows[0] as UserRow | undefined
+      if (!user || user.phone_confirmed_at) return json(200, {})
+      const tooSoon = await this.limitSmsFrequency(phone, 'confirmation_sent_at')
+      if (tooSoon) return tooSoon
+      const messageId = await this.sendSmsCode(user, phone, 'sms', 'confirmation_sent_at')
+      return json(200, messageId ? { message_id: messageId } : {})
+    }
+
+    // phone_change: the number given is the new one, which is where the code goes.
+    const res = await this.db.query(`select * from auth.users where phone_change = $1`, [phone])
+    const user = res.rows[0] as UserRow | undefined
+    if (!user) return json(200, {})
+    const tooSoon = await this.limitPhoneChangeFrequency(user, phone)
+    if (tooSoon) return tooSoon
+    const messageId = await this.sendSmsCode(user, phone, 'phone_change', 'phone_change_sent_at')
+    return json(200, messageId ? { message_id: messageId } : {})
+  }
+
+  /**
+   * `max_frequency` for a phone change: the account's own `phone_change_sent_at`
+   * (the new number has no row to measure by), plus the in-memory window on
+   * the new number itself so one account cannot be used to text it in a loop.
+   */
+  private async limitPhoneChangeFrequency(user: UserRow, newPhone: string): Promise<Response | null> {
+    const seconds = this.settings.maxSmsFrequencySeconds
+    if (!seconds || seconds <= 0) return null
+    const res = await this.db.query(`select phone_change_sent_at as sent_at from auth.users where id = $1`, [user.id])
+    const elapsed = secondsSince((res.rows[0] as { sent_at: Date | string | null } | undefined)?.sent_at)
+    if (elapsed !== null && elapsed < seconds) return AuthHandler.tooSoon(Math.max(1, seconds - elapsed), 'sms')
+    return this.limitSmsFrequency(newPhone, 'phone_change_sent_at')
+  }
+
+  /**
+   * Begin a phone change: park the new number and text it a code. The number
+   * moves only when the code comes back through `/verify` type `phone_change`.
+   * Returns a Response only when the change could not be started.
+   */
+  private async startPhoneChange(user: UserRow, newPhone: string): Promise<Response | null> {
+    const tooSoon = await this.limitPhoneChangeFrequency(user, newPhone)
+    if (tooSoon) return tooSoon
+    await this.db.query(
+      `update auth.users set phone_change = $2, phone_change_sent_at = now(), updated_at = now() where id = $1`,
+      [user.id, newPhone]
+    )
+    // A second change replaces the first outright.
+    await this.db.query(`delete from auth.one_time_tokens where user_id = $1 and token_type = 'phone_change'`, [user.id])
+    await this.sendSmsCode(user, newPhone, 'phone_change', 'phone_change_sent_at')
+    return null
+  }
+
+  /** `verifyOtp({ phone, token, type: 'sms' | 'phone_change' })` → session. */
+  private async verifySmsToken(type: 'sms' | 'phone_change', rawPhone: string | undefined, token: string): Promise<Response> {
+    if (!rawPhone) return authError(400, 'validation_failed', 'phone is required')
+    const phone = normalizePhone(rawPhone)
+    if (!phone) return AuthHandler.invalidPhone()
+    const user = await this.redeem(token, [type], { phone })
+    if (!user) return authError(403, 'otp_expired', 'Token has expired or is invalid')
+    if (type === 'sms') {
+      await this.audit('login', { actorId: user.id, actorEmail: user.email || phone, traits: { provider: 'phone' } })
+      return json(200, await this.sessionFor(user))
+    }
+    // phone_change: the code came back from the new number, so it moves in.
+    // `nullif` guards a pending number cleared in between: better to keep the
+    // number already held than to blank it.
+    const done = await this.db.query(
+      `update auth.users
+          set phone = coalesce(nullif(phone_change, ''), phone),
+              phone_confirmed_at = now(),
+              phone_change = '',
+              phone_change_token = '',
+              updated_at = now()
+        where id = $1
+        returning *`,
+      [user.id]
+    )
+    const moved = (done.rows[0] as UserRow | undefined) ?? user
+    await this.ensurePhoneIdentity(moved)
+    return json(200, await this.sessionFor(moved))
+  }
+
+  // ── admin ─────────────────────────────────────────────────────────────
+
+  private async admin(req: Request, ctx: RequestContext, path: string, method: string): Promise<Response> {
+    if (ctx.role !== 'service_role') {
+      return authError(403, 'insufficient_permissions', 'Admin endpoints require the service_role key')
+    }
+    const idMatch = path.match(/^admin\/users\/([0-9a-f-]{36})$/)
+    const exportMatch = path.match(/^admin\/users\/([0-9a-f-]{36})\/export$/)
+
+    if (path === 'admin/audit' && method === 'GET') {
+      const res = await this.db.query(
+        `select id, payload, created_at, ip_address from auth.audit_log_entries
+         order by created_at desc limit 200`
+      )
+      return json(200, { entries: res.rows })
+    }
+
+    if (exportMatch && method === 'GET') {
+      return await this.exportUser(exportMatch[1])
+    }
+
+    if (path === 'admin/users' && method === 'GET') {
+      const res = await this.db.query(`select * from auth.users order by created_at desc limit 1000`)
+      return json(200, { users: (res.rows as UserRow[]).map((u) => this.userJson(u)), aud: 'authenticated' })
+    }
+    if (path === 'admin/users' && method === 'POST') {
+      const body = (await req.json().catch(() => ({}))) as {
+        email?: string
+        phone?: string
+        password?: string
+        email_confirm?: boolean
+        phone_confirm?: boolean
+        user_metadata?: Record<string, unknown>
+        app_metadata?: Record<string, unknown>
+      }
+      if (!body.email && !body.phone) return authError(400, 'validation_failed', 'email or phone is required')
+      const phone = body.phone ? normalizePhone(body.phone) : null
+      if (body.phone && !phone) return AuthHandler.invalidPhone()
+      const hashed = body.password ? await hashPassword(body.password) : null
+      // The first provider named is the primary one, as GoTrue records it.
+      const provider = body.email ? 'email' : 'phone'
+      const providers = [...(body.email ? ['email'] : []), ...(phone ? ['phone'] : [])]
+      const res = await this.db.query(
+        `insert into auth.users
+           (aud, role, email, phone, encrypted_password, email_confirmed_at, phone_confirmed_at,
+            raw_app_meta_data, raw_user_meta_data)
+         values ('authenticated', 'authenticated', $1, $2, $3,
+                 case when $4 then now() else null end, case when $5 then now() else null end, $6, $7)
+         returning *`,
+        [
+          body.email ? body.email.toLowerCase().trim() : null,
+          phone,
+          hashed,
+          !!body.email && (body.email_confirm ?? true),
+          !!phone && (body.phone_confirm ?? true),
+          JSON.stringify({ provider, providers, ...(body.app_metadata ?? {}) }),
+          JSON.stringify(body.user_metadata ?? {}),
+        ]
+      )
+      return json(200, this.userJson(res.rows[0] as UserRow))
+    }
+    if (idMatch && method === 'GET') {
+      const res = await this.db.query(`select * from auth.users where id = $1`, [idMatch[1]])
+      if (res.rows.length === 0) return authError(404, 'user_not_found', 'User not found')
+      return json(200, this.userJson(res.rows[0] as UserRow))
+    }
+    if (idMatch && method === 'PUT') {
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+      const sets: string[] = []
+      const params: unknown[] = []
+      if (typeof body.email === 'string') {
+        params.push(body.email.toLowerCase().trim())
+        sets.push(`email = $${params.length}`)
+      }
+      if (typeof body.phone === 'string') {
+        const phone = normalizePhone(body.phone)
+        if (!phone) return AuthHandler.invalidPhone()
+        params.push(phone)
+        sets.push(`phone = $${params.length}`)
+      }
+      if (typeof body.password === 'string') {
+        params.push(await hashPassword(body.password))
+        sets.push(`encrypted_password = $${params.length}`)
+      }
+      if (body.user_metadata) {
+        params.push(JSON.stringify(body.user_metadata))
+        sets.push(`raw_user_meta_data = $${params.length}::jsonb`)
+      }
+      if (body.app_metadata) {
+        params.push(JSON.stringify(body.app_metadata))
+        sets.push(`raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || $${params.length}::jsonb`)
+      }
+      if (body.email_confirm === true) sets.push(`email_confirmed_at = now()`)
+      if (body.phone_confirm === true) sets.push(`phone_confirmed_at = now()`)
+      if (sets.length === 0) return authError(400, 'validation_failed', 'nothing to update')
+      params.push(idMatch[1])
+      const res = await this.db.query(
+        `update auth.users set ${sets.join(', ')}, updated_at = now() where id = $${params.length} returning *`,
+        params
+      )
+      if (res.rows.length === 0) return authError(404, 'user_not_found', 'User not found')
+      return json(200, this.userJson(res.rows[0] as UserRow))
+    }
+    if (idMatch && method === 'DELETE') {
+      return await this.eraseUser(idMatch[1])
+    }
+    if (path === 'admin/generate_link' && method === 'POST') {
+      return await this.generateLink(req)
+    }
+    if (path === 'admin/invite' && method === 'POST') {
+      return await this.invite(req)
+    }
+    return authError(404, 'not_found', `unknown admin endpoint`)
+  }
+
+  /**
+   * POST /auth/v1/admin/invite - `auth.admin.inviteUserByEmail`.
+   *
+   * Creates the account and mails a link that signs the recipient in, so they
+   * can set a password. Without it an app has to fake an invite by creating
+   * the user with a password nobody knows and telling them to use "forgot
+   * password" - which mails them a *reset* for an account they have never
+   * heard of.
+   *
+   * An address that already belongs to a confirmed account is refused: that
+   * person has an account, and re-inviting them would mint a link that signs
+   * anyone holding it straight into it. An unconfirmed one is re-invited
+   * instead, because nobody has proved they hold that address yet and the
+   * first invite may simply have been lost.
+   *
+   * Not subject to `disable_signup`, and deliberately not paced by
+   * `max_frequency`, as in GoTrue: this is an operator adding someone to their
+   * own project, not the flooding case those exist for.
+   */
+  private async invite(req: Request): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as { email?: string; data?: Record<string, unknown> }
+    if (!body.email) return authError(400, 'validation_failed', 'email is required')
+    const email = body.email.toLowerCase().trim()
+
+    const existing = await this.db.query(`select id, email_confirmed_at from auth.users where email = $1`, [email])
+    const found = existing.rows[0] as { id: string; email_confirmed_at: Date | string | null } | undefined
+    if (found?.email_confirmed_at) {
+      return authError(422, 'email_exists', 'A user with this email address has already been registered')
+    }
+
+    let userId = found?.id
+    if (!userId) {
+      const created = await this.db.query(
+        `insert into auth.users (aud, role, email, raw_app_meta_data, raw_user_meta_data)
+         values ('authenticated', 'authenticated', $1, '{"provider":"email","providers":["email"]}', $2)
+         returning id`,
+        [email, JSON.stringify(body.data ?? {})]
+      )
+      userId = (created.rows[0] as { id: string }).id
+      await this.db.query(
+        `insert into auth.identities (user_id, provider, provider_id, identity_data)
+         values ($1, 'email', $2, $3)
+         on conflict (provider, provider_id) do nothing`,
+        [userId, userId, JSON.stringify({ sub: userId, email })]
+      )
+    } else if (body.data) {
+      await this.db.query(
+        `update auth.users
+            set raw_user_meta_data = coalesce(raw_user_meta_data, '{}'::jsonb) || $2::jsonb, updated_at = now()
+          where id = $1`,
+        [userId, JSON.stringify(body.data)]
+      )
+    }
+    // GoTrue stamps invited_at alongside confirmation_sent_at, so a row can be
+    // told apart from one that signed itself up.
+    await this.db.query(`update auth.users set invited_at = now(), updated_at = now() where id = $1`, [userId])
+
+    // createUser false: the row exists by now, and going through issueToken is
+    // what keeps an invite on the same token, template and hook path as every
+    // other emailed link rather than growing a second one.
+    const sent = await this.issueToken(email, 'otp', false, {
+      flavor: 'invite',
+      redirectTo: new URL(req.url).searchParams.get('redirect_to'),
+    })
+    if (sent.status !== 200) return sent
+
+    await this.audit('user_invited', { actorId: userId, actorEmail: email })
+    const res = await this.db.query(`select * from auth.users where id = $1`, [userId])
+    return json(200, this.userJson(res.rows[0] as UserRow))
+  }
+
+  /**
+   * POST /auth/v1/admin/generate_link - mint a link/OTP and return it instead of
+   * emailing it, so a caller (typically an e2e test harness) can deliver or
+   * redeem it itself. No mail is sent, matching GoTrue.
+   *
+   * The response is deliberately flat - user fields alongside `action_link`,
+   * `email_otp`, `hashed_token`, `redirect_to` and `verification_type` - because
+   * supabase-js splits that shape into `{ user, properties }` client-side. A
+   * nested response would leave `data.properties` undefined.
+   *
+   * `hashed_token` is the same opaque one-time token the emailed link carries;
+   * tinbase stores one-time tokens verbatim rather than hashing them, so there
+   * is nothing to un-hash and `verifyOtp({ token_hash })` redeems it directly.
+   */
+  private async generateLink(req: Request): Promise<Response> {
+    const body = (await req.json().catch(() => ({}))) as {
+      type?: string
+      email?: string
+      password?: string
+      data?: Record<string, unknown>
+      redirect_to?: string
+    }
+    if (!body.email) return authError(400, 'validation_failed', 'email is required')
+    const type = body.type ?? 'magiclink'
+
+    // The two sides of an email change mint against a pending address, so they
+    // need `new_email` as well and cannot share the flow below.
+    if (type === 'email_change_current' || type === 'email_change_new') {
+      return await this.generateEmailChangeLink(type, body)
+    }
+    if (!['signup', 'invite', 'magiclink', 'recovery'].includes(type)) {
+      return authError(400, 'validation_failed', `unsupported generate_link type: ${type}`)
+    }
+
+    // recovery is a reset for an existing account; the other three are the
+    // account-creating flows, mirroring how signup/otp already behave.
+    const tokenType = type === 'recovery' ? 'recovery' : 'otp'
+    const minted = await this.mintOneTimeToken(body.email, tokenType, type !== 'recovery')
+    if ('error' in minted) return minted.error
+    let { user } = minted
+    const { code, linkToken } = minted
+
+    // Optional extras GoTrue accepts on the signup/invite flows.
+    if (body.password || body.data) {
+      const sets: string[] = []
+      const params: unknown[] = []
+      if (body.password) {
+        params.push(await hashPassword(body.password))
+        sets.push(`encrypted_password = $${params.length}`)
+      }
+      if (body.data) {
+        params.push(JSON.stringify(body.data))
+        sets.push(`raw_user_meta_data = coalesce(raw_user_meta_data, '{}'::jsonb) || $${params.length}::jsonb`)
+      }
+      params.push(user.id)
+      const res = await this.db.query(
+        `update auth.users set ${sets.join(', ')}, updated_at = now() where id = $${params.length} returning *`,
+        params
+      )
+      user = (res.rows[0] as UserRow) ?? user
+    }
+
+    const redirectTo = resolveRedirect(
+      body.redirect_to,
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
+    const actionLink =
+      `${this.apiUrl}/auth/v1/verify?token=${linkToken}&type=${type}` +
+      `&redirect_to=${encodeURIComponent(redirectTo)}`
+
+    await this.audit('generate_link', { actorId: user.id, actorEmail: user.email, traits: { type } })
+
+    return json(200, {
+      ...this.userJson(user),
+      action_link: actionLink,
+      email_otp: code,
+      hashed_token: linkToken,
+      redirect_to: redirectTo,
+      verification_type: type,
+    })
+  }
+
+  /**
+   * `admin.generateLink({ type: 'email_change_current' | 'email_change_new' })`.
+   *
+   * Both sides are minted whichever is asked for - they are one change, and
+   * minting only the requested half would leave a secure change that can never
+   * complete. The caller gets the link for the side it named.
+   */
+  private async generateEmailChangeLink(
+    type: 'email_change_current' | 'email_change_new',
+    body: { email?: string; new_email?: string; redirect_to?: string }
+  ): Promise<Response> {
+    if (!body.email) return authError(400, 'validation_failed', 'email is required')
+    if (!body.new_email) return authError(400, 'validation_failed', `${type} requires new_email`)
+    const current = body.email.toLowerCase().trim()
+    const next = body.new_email.toLowerCase().trim()
+
+    const res = await this.db.query(`select * from auth.users where email = $1`, [current])
+    const user = res.rows[0] as UserRow | undefined
+    if (!user) return authError(404, 'user_not_found', 'User not found')
+    const clash = await this.db.query(`select id from auth.users where email = $1 and id <> $2`, [next, user.id])
+    if (clash.rows.length > 0) {
+      return authError(422, 'email_exists', 'A user with this address has already been registered')
+    }
+
+    const { newToken, currentToken } = await this.mintEmailChangeTokens(user, next)
+    // Asking for the current side when secure email change is off: there is no
+    // such token, and returning the new one under that name would quietly hand
+    // back a link that confirms the wrong half.
+    if (type === 'email_change_current' && !currentToken) {
+      return authError(
+        400,
+        'validation_failed',
+        'email_change_current requires secure_email_change_enabled; only the new address is confirmed'
+      )
+    }
+    const token = type === 'email_change_new' ? newToken : currentToken!
+
+    const redirectTo = resolveRedirect(
+      body.redirect_to,
+      this.config.siteUrl,
+      this.config.uriAllowList,
+      this.config.enforceRedirectAllowList
+    )
+    await this.audit('generate_link', { actorId: user.id, actorEmail: user.email, traits: { type } })
+    return json(200, {
+      ...this.userJson(user),
+      action_link:
+        `${this.apiUrl}/auth/v1/verify?token=${token}&type=email_change` +
+        `&redirect_to=${encodeURIComponent(redirectTo)}`,
+      email_otp: '',
+      hashed_token: token,
+      redirect_to: redirectTo,
+      verification_type: type,
+    })
+  }
+
+  // ── audit trail ───────────────────────────────────────────────────────
+
+  /**
+   * Append a security event to auth.audit_log_entries (GoTrue-compatible
+   * payload). Best-effort: a logging failure never breaks the request.
+   */
+  private async audit(
+    action: string,
+    opts: { actorId?: string | null; actorEmail?: string | null; type?: string; traits?: Record<string, unknown> } = {}
+  ): Promise<void> {
+    try {
+      const payload = {
+        action,
+        actor_id: opts.actorId ?? null,
+        actor_username: opts.actorEmail ?? null,
+        log_type: opts.type ?? 'account',
+        traits: opts.traits ?? {},
+        timestamp: new Date().toISOString(),
+      }
+      await this.db.query(`insert into auth.audit_log_entries (payload) values ($1::jsonb)`, [JSON.stringify(payload)])
+    } catch {
+      // audit logging is best-effort
+    }
+  }
+
+  // ── GDPR: data-subject access (export) ────────────────────────────────
+
+  /**
+   * Export everything held about one user across the auth schema, for a GDPR
+   * right-of-access / portability request. Credentials (password hash, MFA
+   * secrets, raw token values) are deliberately omitted - they are not personal
+   * data to hand back and exporting them would leak secrets.
+   */
+  private async exportUser(userId: string): Promise<Response> {
+    const ures = await this.db.query(`select * from auth.users where id = $1`, [userId])
+    if (ures.rows.length === 0) return authError(404, 'user_not_found', 'User not found')
+    const user = ures.rows[0] as UserRow & Record<string, unknown>
+
+    const identities = await this.db.query(
+      `select id, provider, provider_id, identity_data, last_sign_in_at, created_at, updated_at
+       from auth.identities where user_id = $1`,
+      [userId]
+    )
+    const sessions = await this.db.query(
+      `select id, parent, session_id, revoked, created_at, updated_at
+       from auth.refresh_tokens where user_id = $1`,
+      [userId]
+    )
+    const factors = await this.db.query(
+      `select id, friendly_name, factor_type, status, created_at, updated_at
+       from auth.mfa_factors where user_id = $1`,
+      [userId]
+    )
+
+    // strip credential/token columns from the raw record before returning it
+    const SENSITIVE = [
+      'encrypted_password',
+      'confirmation_token',
+      'recovery_token',
+      'email_change_token_new',
+      'email_change_token_current',
+      'phone_change_token',
+      'reauthentication_token',
+    ]
+    const userSafe = Object.fromEntries(Object.entries(user).filter(([k]) => !SENSITIVE.includes(k)))
+    await this.audit('user_data_exported', { actorId: userId, type: 'admin' })
+    return json(200, {
+      exported_at: new Date().toISOString(),
+      user: this.userJson(user),
+      user_record: userSafe,
+      identities: identities.rows,
+      sessions: sessions.rows,
+      mfa_factors: factors.rows,
+    })
+  }
+
+  /**
+   * Erase a user (GDPR right to erasure). Deletes the user row; auth.identities,
+   * refresh_tokens, one_time_tokens, flow_state, and mfa_factors/challenges are
+   * removed by their ON DELETE CASCADE foreign keys. Returns a 404 if the user
+   * doesn't exist and a summary of what was erased.
+   *
+   * Note: storage.objects.owner has no FK to auth.users, so object rows/bytes
+   * owned by the user are not removed here - see COMPLIANCE.md for the
+   * storage-erasure step the operator must run.
+   */
+  private async eraseUser(userId: string): Promise<Response> {
+    const before = await this.db.query<{ identities: number; sessions: number; factors: number }>(
+      `select
+         (select count(*) from auth.identities where user_id = $1)::int as identities,
+         (select count(*) from auth.refresh_tokens where user_id = $1)::int as sessions,
+         (select count(*) from auth.mfa_factors where user_id = $1)::int as factors`,
+      [userId]
+    )
+    const del = await this.db.query(`delete from auth.users where id = $1 returning id`, [userId])
+    if (del.rows.length === 0) return authError(404, 'user_not_found', 'User not found')
+    const c = before.rows[0]
+    await this.audit('user_deleted', { actorId: userId, type: 'admin', traits: { erased: true } })
+    return json(200, {
+      erased: true,
+      user_id: userId,
+      cascaded: { identities: c.identities, sessions: c.sessions, mfa_factors: c.factors },
+    })
+  }
+
+  // ── MFA (TOTP) ────────────────────────────────────────────────────────
+
+  private async enrollFactor(req: Request): Promise<Response> {
+    const user = await this.userFromBearer(req)
+    if (!user) return authError(401, 'no_authorization', 'This endpoint requires a Bearer token')
+    const body = (await req.json().catch(() => ({}))) as {
+      factor_type?: string
+      friendly_name?: string
+      issuer?: string
+    }
+    const factorType = body.factor_type ?? 'totp'
+    if (factorType !== 'totp') {
+      return authError(422, 'validation_failed', 'Only the totp factor type is supported')
+    }
+    if (!this.settings.totpEnrollEnabled) {
+      return authError(422, 'mfa_totp_enroll_disabled', 'TOTP enrollment is disabled')
+    }
+    const enrolled = await this.db.query(
+      `select count(*)::int as n from auth.mfa_factors where user_id = $1`,
+      [user.id]
+    )
+    if ((enrolled.rows[0] as { n: number }).n >= this.settings.maxEnrolledFactors) {
+      return authError(422, 'too_many_enrolled_mfa_factors', 'Maximum number of enrolled MFA factors reached')
+    }
+    const friendlyName = body.friendly_name ?? null
+    if (friendlyName) {
+      const dup = await this.db.query(
+        `select 1 from auth.mfa_factors where user_id = $1 and friendly_name = $2`,
+        [user.id, friendlyName]
+      )
+      if (dup.rows.length > 0) {
+        return authError(422, 'mfa_factor_name_conflict', 'A factor with this friendly name already exists')
+      }
+    }
+    const secret = generateTotpSecret()
+    let issuer = body.issuer
+    if (!issuer) {
+      try {
+        issuer = new URL(this.config.siteUrl).host || 'tinbase'
+      } catch {
+        issuer = 'tinbase'
+      }
+    }
+    const uri = otpauthUri({ secret, account: user.email || user.id, issuer })
+    const ins = await this.db.query(
+      `insert into auth.mfa_factors (user_id, friendly_name, factor_type, status, secret)
+       values ($1, $2, 'totp', 'unverified', $3) returning id`,
+      [user.id, friendlyName, secret]
+    )
+    const id = (ins.rows[0] as { id: string }).id
+    return json(200, {
+      id,
+      type: 'totp',
+      friendly_name: friendlyName,
+      status: 'unverified',
+      totp: { qr_code: qrSvgDataUri(uri), secret, uri },
+    })
+  }
+
+  private async challengeFactor(req: Request, factorId: string): Promise<Response> {
+    const user = await this.userFromBearer(req)
+    if (!user) return authError(401, 'no_authorization', 'This endpoint requires a Bearer token')
+    if (!this.settings.totpVerifyEnabled) {
+      return authError(422, 'mfa_totp_verify_disabled', 'TOTP verification is disabled')
+    }
+    const fr = await this.db.query(`select id from auth.mfa_factors where id = $1 and user_id = $2`, [factorId, user.id])
+    if (fr.rows.length === 0) return authError(404, 'mfa_factor_not_found', 'MFA factor not found')
+    const expiresAt = new Date(Date.now() + 300_000).toISOString()
+    const ins = await this.db.query(
+      `insert into auth.mfa_challenges (factor_id, expires_at) values ($1, $2) returning id, expires_at`,
+      [factorId, expiresAt]
+    )
+    const c = ins.rows[0] as { id: string; expires_at: string | Date }
+    return json(200, {
+      id: c.id,
+      type: 'totp',
+      expires_at: Math.floor(new Date(c.expires_at).getTime() / 1000),
+    })
+  }
+
+  private async verifyFactor(req: Request, factorId: string): Promise<Response> {
+    const user = await this.userFromBearer(req)
+    if (!user) return authError(401, 'no_authorization', 'This endpoint requires a Bearer token')
+    const body = (await req.json().catch(() => ({}))) as { challenge_id?: string; code?: string }
+    const fr = await this.db.query(
+      `select id, secret, status from auth.mfa_factors where id = $1 and user_id = $2`,
+      [factorId, user.id]
+    )
+    const factor = fr.rows[0] as { id: string; secret: string; status: string } | undefined
+    if (!factor) return authError(404, 'mfa_factor_not_found', 'MFA factor not found')
+    const cr = await this.db.query(
+      `select id, expires_at, verified_at from auth.mfa_challenges where id = $1 and factor_id = $2`,
+      [body.challenge_id ?? '', factorId]
+    )
+    const challenge = cr.rows[0] as { id: string; expires_at: string | Date; verified_at: string | Date | null } | undefined
+    if (!challenge) return authError(404, 'mfa_challenge_not_found', 'MFA challenge not found')
+    if (new Date(challenge.expires_at).getTime() < Date.now()) {
+      return authError(422, 'mfa_challenge_expired', 'MFA challenge has expired, verify against another one')
+    }
+    // a challenge is single-use: once verified it cannot be replayed
+    if (challenge.verified_at) {
+      return authError(422, 'mfa_verification_failed', 'This challenge has already been verified')
+    }
+    if (!(await verifyTotp(factor.secret, body.code ?? ''))) {
+      return authError(422, 'mfa_verification_failed', 'Invalid TOTP code entered')
+    }
+    await this.db.query(`update auth.mfa_challenges set verified_at = now() where id = $1`, [challenge.id])
+    if (factor.status !== 'verified') {
+      await this.db.query(`update auth.mfa_factors set status = 'verified', updated_at = now() where id = $1`, [factorId])
+    }
+    // elevate the session to aal2 for the same user
+    const session = await this.sessionFor(user, undefined, {
+      aal: 'aal2',
+      amr: [
+        { method: 'password', timestamp: Math.floor(Date.now() / 1000) },
+        { method: 'totp', timestamp: Math.floor(Date.now() / 1000) },
+      ],
+    })
+    return json(200, session)
+  }
+
+  private async unenrollFactor(req: Request, factorId: string): Promise<Response> {
+    const user = await this.userFromBearer(req)
+    if (!user) return authError(401, 'no_authorization', 'This endpoint requires a Bearer token')
+    const del = await this.db.query(
+      `delete from auth.mfa_factors where id = $1 and user_id = $2 returning id`,
+      [factorId, user.id]
+    )
+    if (del.rows.length === 0) return authError(404, 'mfa_factor_not_found', 'MFA factor not found')
+    return json(200, { id: factorId })
+  }
+
+  private async getUserFactors(userId: string): Promise<Record<string, unknown>[]> {
+    const res = await this.db.query(
+      `select id, friendly_name, factor_type, status, created_at, updated_at
+       from auth.mfa_factors where user_id = $1 order by created_at`,
+      [userId]
+    )
+    return (res.rows as Record<string, unknown>[]).map((f) => ({
+      id: f.id,
+      friendly_name: f.friendly_name ?? null,
+      factor_type: f.factor_type,
+      status: f.status,
+      created_at: iso(f.created_at as Date | string | null),
+      updated_at: iso(f.updated_at as Date | string | null),
+    }))
+  }
+
+  /** GoTrue-shaped identities for a user (linked providers), from auth.identities. */
+  private async getUserIdentities(userId: string): Promise<Record<string, unknown>[]> {
+    const res = await this.db.query(
+      `select id, provider_id, user_id, identity_data, provider, created_at, updated_at, last_sign_in_at
+       from auth.identities where user_id = $1 order by created_at`,
+      [userId]
+    )
+    return (res.rows as Record<string, unknown>[]).map((r) => ({
+      identity_id: r.id,
+      id: r.provider_id,
+      user_id: r.user_id,
+      identity_data: r.identity_data ?? {},
+      provider: r.provider,
+      last_sign_in_at: iso(r.last_sign_in_at as Date | string | null),
+      created_at: iso(r.created_at as Date | string | null),
+      updated_at: iso(r.updated_at as Date | string | null),
+    }))
+  }
+
+  // ── helpers ───────────────────────────────────────────────────────────
+
+  /**
+   * Resolve the bearer token to a user, rejecting tokens whose session has been
+   * logged out.
+   *
+   * A valid signature is not enough here: GoTrue's `/user` consults session
+   * state, which is the whole reason server-side code validates with
+   * `getUser(jwt)` instead of verifying the JWT locally - so that a logout takes
+   * effect immediately rather than at expiry.
+   *
+   * Only tokens that carry a `session_id` are subject to the check. Ones that
+   * don't (the studio's impersonation token, for instance) have no session to
+   * revoke and behave as before.
+   *
+   * Note this deliberately does not extend to REST: PostgREST validates the JWT
+   * signature and nothing else, so a logged-out token keeps working there until
+   * it expires, in real Supabase as much as here.
+   */
+  private async userFromBearer(req: Request): Promise<UserRow | null> {
+    const authz = req.headers.get('authorization') ?? ''
+    if (!authz.toLowerCase().startsWith('bearer ')) return null
+    const claims = await verifyJwt(authz.slice(7), this.config.jwtSecret)
+    if (!claims?.sub) return null
+    const sessionId = (claims as { session_id?: unknown }).session_id
+    if (typeof sessionId === 'string' && sessionId) {
+      const live = await this.db.query(
+        `select 1 from auth.sessions where id = $1 and (not_after is null or not_after > now())`,
+        [sessionId]
+      )
+      if (live.rows.length === 0) return null
+    }
+    const res = await this.db.query(`select * from auth.users where id = $1`, [claims.sub])
+    return (res.rows[0] as UserRow) ?? null
+  }
+
+  /** The session_id claim on a request's bearer token, if it carries one. */
+  private async sessionIdFromBearer(req: Request): Promise<string | null> {
+    const authz = req.headers.get('authorization') ?? ''
+    if (!authz.toLowerCase().startsWith('bearer ')) return null
+    const claims = await verifyJwt(authz.slice(7), this.config.jwtSecret)
+    const sessionId = (claims as { session_id?: unknown } | null)?.session_id
+    return typeof sessionId === 'string' && sessionId ? sessionId : null
+  }
+
+  /** Shape a user row into the GoTrue user object supabase-js expects. */
+  userJson(
+    u: UserRow,
+    factors: Record<string, unknown>[] = [],
+    identities: Record<string, unknown>[] = []
+  ): Record<string, unknown> {
+    return {
+      id: u.id,
+      aud: u.aud ?? 'authenticated',
+      role: u.role ?? 'authenticated',
+      email: u.email ?? '',
+      // GoTrue reports a change that has been asked for but not yet confirmed,
+      // so a client can say "we've emailed <new_email>" instead of showing the
+      // old address with no sign anything is pending.
+      new_email: u.email_change || undefined,
+      email_confirmed_at: iso(u.email_confirmed_at),
+      phone: u.phone ?? '',
+      new_phone: u.phone_change || undefined,
+      phone_confirmed_at: iso(u.phone_confirmed_at),
+      // GoTrue: the earlier of the two confirmations; an account confirmed by
+      // either channel is confirmed.
+      confirmed_at: iso(u.email_confirmed_at ?? u.phone_confirmed_at),
+      last_sign_in_at: iso(u.last_sign_in_at),
+      app_metadata: u.raw_app_meta_data ?? {},
+      user_metadata: u.raw_user_meta_data ?? {},
+      identities,
+      factors,
+      created_at: iso(u.created_at),
+      updated_at: iso(u.updated_at),
+      is_anonymous: u.is_anonymous ?? false,
+    }
+  }
+
+  /** Session tokens for a bare user id (used by the OAuth implicit callback). */
+  private async sessionTokensFor(userId: string): Promise<{ access_token: string; refresh_token: string; expires_in: number }> {
+    const res = await this.db.query(`select * from auth.users where id = $1`, [userId])
+    const session = (await this.sessionFor(res.rows[0] as UserRow)) as {
+      access_token: string
+      refresh_token: string
+      expires_in: number
+    }
+    return { access_token: session.access_token, refresh_token: session.refresh_token, expires_in: session.expires_in }
+  }
+
+  private async sessionFor(
+    user: UserRow,
+    parentToken?: string,
+    opts?: { aal?: string; amr?: { method: string; timestamp: number }[]; sessionId?: string }
+  ): Promise<Record<string, unknown>> {
+    const now = Math.floor(Date.now() / 1000)
+    // Cap the access-token lifetime at the session timebox so a timeboxed
+    // session can't outlive its absolute deadline (config.toml auth.sessions.timebox).
+    const lifetime = this.config.sessionTimeboxSeconds
+      ? Math.min(this.config.jwtExpiry, this.config.sessionTimeboxSeconds)
+      : this.config.jwtExpiry
+    const expiresAt = now + lifetime
+    // Refreshing keeps the same session: a refresh is not a new login, and
+    // minting a fresh id would strand the previous access token's session_id on
+    // a row nothing points at, so the outgoing token would be rejected the
+    // moment the client refreshed.
+    const sessionId = opts?.sessionId ?? crypto.randomUUID()
+    const claims: JwtClaims = {
+      iss: `${this.apiUrl}/auth/v1`,
+      sub: user.id,
+      aud: user.aud ?? 'authenticated',
+      exp: expiresAt,
+      iat: now,
+      email: user.email ?? '',
+      phone: user.phone ?? '',
+      app_metadata: user.raw_app_meta_data ?? {},
+      user_metadata: user.raw_user_meta_data ?? {},
+      role: user.role ?? 'authenticated',
+      is_anonymous: user.is_anonymous ?? false,
+      session_id: sessionId,
+      aal: opts?.aal ?? 'aal1',
+      amr: opts?.amr ?? [{ method: 'password', timestamp: now }],
+    }
+    const accessToken = await signJwt(claims, this.config.jwtSecret)
+    const refreshToken = randomToken(24)
+    // Record the session before handing out a token that references it, so
+    // /auth/v1/user can never see a valid-looking token with no session row.
+    await this.db.query(
+      `insert into auth.sessions (id, user_id, not_after) values ($1, $2, $3)
+       on conflict (id) do update set updated_at = now()`,
+      [
+        sessionId,
+        user.id,
+        this.config.sessionTimeboxSeconds ? new Date((now + this.config.sessionTimeboxSeconds) * 1000).toISOString() : null,
+      ]
+    )
+    await this.db.query(
+      `insert into auth.refresh_tokens (token, user_id, parent, session_id) values ($1, $2, $3, $4)`,
+      [refreshToken, user.id, parentToken ?? null, sessionId]
+    )
+    return {
+      access_token: accessToken,
+      token_type: 'bearer',
+      expires_in: lifetime,
+      expires_at: expiresAt,
+      refresh_token: refreshToken,
+      user: this.userJson(user, await this.getUserFactors(user.id), await this.getUserIdentities(user.id)),
+    }
+  }
+}

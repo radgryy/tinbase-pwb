@@ -1,0 +1,220 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── design tokens ─────────────────────────────────────────────────────────
+   Semantic tokens only — components never hardcode palette values. The dark
+   set mirrors the original studio palette exactly; light is its counterpart. */
+
+:root {
+  color-scheme: light;
+  --background: #ffffff;
+  --foreground: #0a0a0a;
+  --card: #f9f8f6;
+  --card-foreground: #0a0a0a;
+  --popover: #ffffff;
+  --popover-foreground: #0a0a0a;
+  --sidebar: #f9f8f6;
+  --sidebar-foreground: #858585;
+  --primary: #0a0a0a;
+  --primary-foreground: #ffffff;
+  --brand: #0a0a0a;
+  --secondary: #f2ede5;
+  --muted: #f2ede5;
+  --muted-foreground: #858585;
+  --accent: #f2ede5;
+  --accent-foreground: #0a0a0a;
+  --destructive: #ff5f57;
+  --destructive-foreground: #ffffff;
+  --warning: #ffbd2e;
+  --info: #2563eb;
+  --border: #d5d9e2;
+  --input: #d5d9e2;
+  --field: #ffffff;
+  --code: #f2ede5;
+  --selected: #f2ede5;
+  --ring: #0a0a0a;
+  --radius: 0.5rem;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #0a0a0a;
+  --foreground: #ededed;
+  --card: #151515;
+  --card-foreground: #ededed;
+  --popover: #1c1c1c;
+  --popover-foreground: #d5d9e2;
+  --sidebar: #0f0f0f;
+  --sidebar-foreground: #9d9d9d;
+  --primary: #ffffff;
+  --primary-foreground: #0a0a0a;
+  --brand: #ffffff;
+  --secondary: #151515;
+  --muted: #262626;
+  --muted-foreground: #9d9d9d;
+  --accent: #1f1f1f;
+  --accent-foreground: #ededed;
+  --destructive: #ff5f57;
+  --destructive-foreground: #ffffff;
+  --warning: #ffbd2e;
+  --info: #60a5fa;
+  --border: #2a2a2a;
+  --input: #404040;
+  --field: #151515;
+  --code: #141414;
+  --selected: #262626;
+  --ring: #ffffff;
+}
+
+@theme inline {
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "GeistMono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-brand: var(--brand);
+  --color-secondary: var(--secondary);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-field: var(--field);
+  --color-code: var(--code);
+  --color-selected: var(--selected);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--background);
+    color: var(--foreground);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* xAI: negatywne tracking na nagłówkach, hierarchy przez rozmiar, nie wagę */
+  h1, h2, h3 {
+    letter-spacing: -0.025em;
+    font-weight: 500;
+  }
+  h1 {
+    line-height: 1.0;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+/* ── Nocturne: glass panel + aurora glow ── */
+.glass {
+  background: color-mix(in oklab, var(--card) 82%, transparent);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+}
+.glow-primary {
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--primary) 35%, transparent),
+    0 0 24px color-mix(in oklab, var(--primary) 25%, transparent);
+}
+
+/* ── animations ── */
+@keyframes sheet-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+@keyframes sheet-out {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* ── Ace — blend into the token palette (theme file is swapped per mode) ── */
+.ace_editor {
+  background: transparent !important;
+  line-height: 1.6 !important;
+}
+.ace_editor .ace_gutter {
+  background: transparent !important;
+  color: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+}
+.ace_editor .ace_gutter-active-line {
+  background: color-mix(in oklab, var(--accent) 60%, transparent) !important;
+}
+.ace_editor .ace_active-line {
+  background: color-mix(in oklab, var(--accent) 50%, transparent) !important;
+}
+.ace_editor .ace_selection {
+  background: color-mix(in oklab, var(--brand) 22%, transparent) !important;
+}
+.ace_editor .ace_cursor {
+  color: var(--foreground);
+}
+.ace_placeholder {
+  color: color-mix(in oklab, var(--muted-foreground) 60%, transparent) !important;
+  font-family: inherit !important;
+  padding: 0 !important;
+}
+
+/* ── Studio-dense scrollbars ── */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--muted);
+  border-radius: 6px;
+  border: 2px solid var(--background);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-foreground);
+}

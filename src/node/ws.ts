@@ -1,0 +1,219 @@
+/**
+ * Minimal RFC 6455 WebSocket server on top of node:http upgrade events -
+ * enough for Phoenix-protocol JSON text frames, so no `ws` dependency.
+ */
+import { createHash } from 'node:crypto'
+import type { IncomingMessage } from 'node:http'
+import type { Duplex } from 'node:stream'
+import type { RealtimeSocketLike } from '../realtime/engine.js'
+
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+/** Largest inbound frame payload accepted before the connection is failed (RFC 6455 §7.4.1, 1009). */
+const MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+/** Returned by {@link decodeFrame} when a frame declares a payload larger than {@link MAX_FRAME_BYTES}. */
+export const FRAME_TOO_LARGE = Symbol('frame-too-large')
+
+/** A live socket. Callbacks are assigned by the realtime session after accept. */
+export interface WsConnection extends RealtimeSocketLike {
+  /** invoked per decoded inbound message frame; null until the session wires it up */
+  onMessage: ((data: string | Uint8Array) => void) | null
+  /** invoked once when the socket closes; null until the session wires it up */
+  onClose: (() => void) | null
+}
+
+/**
+ * Complete the RFC 6455 handshake on an http upgrade and return a connection
+ * that decodes inbound frames and encodes outbound ones. Returns null (and
+ * writes a 400) if the request isn't a valid websocket upgrade.
+ *
+ * `head` is any bytes node already read past the upgrade request; they're
+ * prepended to the frame buffer so a client that pipelines its first frame
+ * isn't dropped.
+ */
+export function acceptWebSocket(req: IncomingMessage, socket: Duplex, head: Buffer): WsConnection | null {
+  const key = req.headers['sec-websocket-key']
+  if (!key || (req.headers.upgrade ?? '').toLowerCase() !== 'websocket') {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n')
+    socket.destroy()
+    return null
+  }
+  const accept = createHash('sha1').update(key + WS_GUID).digest('base64')
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      `Sec-WebSocket-Accept: ${accept}\r\n` +
+      '\r\n'
+  )
+
+  let buffer = head.length > 0 ? Buffer.from(head) : Buffer.alloc(0)
+  let fragments: Buffer[] = []
+  let fragmentOpcode = 0
+  let closed = false
+
+  const conn: WsConnection = {
+    onMessage: null,
+    onClose: null,
+    send(data: string | Uint8Array) {
+      if (closed) return
+      if (typeof data === 'string') {
+        socket.write(encodeFrame(0x1, Buffer.from(data, 'utf8')))
+      } else {
+        socket.write(encodeFrame(0x2, Buffer.from(data)))
+      }
+    },
+    close(code = 1000, reason = '') {
+      if (closed) return
+      const payload = Buffer.alloc(2 + Buffer.byteLength(reason))
+      payload.writeUInt16BE(code, 0)
+      payload.write(reason, 2)
+      socket.write(encodeFrame(0x8, payload))
+      finish()
+    },
+  }
+
+  function finish() {
+    if (closed) return
+    closed = true
+    socket.end()
+    conn.onClose?.()
+  }
+
+  function deliver(opcode: number, payload: Buffer): void {
+    if (opcode === 0x1) conn.onMessage?.(payload.toString('utf8'))
+    else if (opcode === 0x2) conn.onMessage?.(new Uint8Array(payload))
+  }
+
+  socket.on('data', (chunk: Buffer) => {
+    buffer = Buffer.concat([buffer, chunk])
+    processFrames()
+  })
+  socket.on('close', finish)
+  socket.on('error', finish)
+
+  function processFrames(): void {
+    while (true) {
+      const frame = decodeFrame(buffer)
+      if (frame === FRAME_TOO_LARGE) {
+        conn.close(1009, 'frame too large')
+        return
+      }
+      if (!frame) return
+      buffer = buffer.subarray(frame.frameLength)
+
+      // RFC 6455 §5.1: every frame from the client MUST be masked; fail the
+      // connection with a protocol error (1002) otherwise.
+      if (!frame.masked) {
+        conn.close(1002, 'unmasked frame')
+        return
+      }
+
+      switch (frame.opcode) {
+        case 0x0: // continuation
+          fragments.push(frame.payload)
+          if (frame.fin) {
+            const full = Buffer.concat(fragments)
+            fragments = []
+            deliver(fragmentOpcode, full)
+          }
+          break
+        case 0x1: // text
+        case 0x2: // binary
+          if (frame.fin) {
+            deliver(frame.opcode, frame.payload)
+          } else {
+            fragments = [frame.payload]
+            fragmentOpcode = frame.opcode
+          }
+          break
+        case 0x8: // close
+          if (!closed) {
+            socket.write(encodeFrame(0x8, frame.payload.subarray(0, 2)))
+          }
+          finish()
+          return
+        case 0x9: // ping
+          socket.write(encodeFrame(0xa, frame.payload))
+          break
+        case 0xa: // pong
+          break
+      }
+    }
+  }
+
+  return conn
+}
+
+interface Frame {
+  /** FIN bit: true when this frame completes a message (not a fragment continuation) */
+  fin: boolean
+  /** RFC 6455 opcode (0x0 continuation, 0x1 text, 0x2 binary, 0x8 close, 0x9 ping, 0xa pong) */
+  opcode: number
+  /** whether the payload is masked; every client-to-server frame must be */
+  masked: boolean
+  /** the (already unmasked) frame payload bytes */
+  payload: Buffer
+  /** total bytes this frame occupies in the buffer (header + payload) */
+  frameLength: number
+}
+
+/**
+ * Decode one frame from the front of `buf`. Returns null when more bytes are
+ * needed (partial frame), {@link FRAME_TOO_LARGE} when the declared 64-bit
+ * length exceeds {@link MAX_FRAME_BYTES}, else the frame with its `frameLength`
+ * so the caller can advance the buffer. Unmasks payloads in place.
+ */
+export function decodeFrame(buf: Buffer): Frame | null | typeof FRAME_TOO_LARGE {
+  if (buf.length < 2) return null
+  const fin = (buf[0] & 0x80) !== 0
+  const opcode = buf[0] & 0x0f
+  const masked = (buf[1] & 0x80) !== 0
+  let payloadLength = buf[1] & 0x7f
+  let offset = 2
+
+  if (payloadLength === 126) {
+    if (buf.length < offset + 2) return null
+    payloadLength = buf.readUInt16BE(offset)
+    offset += 2
+  } else if (payloadLength === 127) {
+    if (buf.length < offset + 8) return null
+    const big = buf.readBigUInt64BE(offset)
+    if (big > BigInt(MAX_FRAME_BYTES)) return FRAME_TOO_LARGE
+    payloadLength = Number(big)
+    offset += 8
+  }
+
+  let maskKey: Buffer | null = null
+  if (masked) {
+    if (buf.length < offset + 4) return null
+    maskKey = buf.subarray(offset, offset + 4)
+    offset += 4
+  }
+  if (buf.length < offset + payloadLength) return null
+
+  let payload = Buffer.from(buf.subarray(offset, offset + payloadLength))
+  if (maskKey) {
+    for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4]
+  }
+  return { fin, opcode, masked, payload, frameLength: offset + payloadLength }
+}
+
+function encodeFrame(opcode: number, payload: Buffer): Buffer {
+  let header: Buffer
+  if (payload.length < 126) {
+    header = Buffer.from([0x80 | opcode, payload.length])
+  } else if (payload.length < 65536) {
+    header = Buffer.alloc(4)
+    header[0] = 0x80 | opcode
+    header[1] = 126
+    header.writeUInt16BE(payload.length, 2)
+  } else {
+    header = Buffer.alloc(10)
+    header[0] = 0x80 | opcode
+    header[1] = 127
+    header.writeBigUInt64BE(BigInt(payload.length), 2)
+  }
+  return Buffer.concat([header, payload])
+}
